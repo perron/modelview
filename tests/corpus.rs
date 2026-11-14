@@ -218,7 +218,7 @@ fn render_matches_lavapipe_goldens_and_export_reloads() {
             .status()
             .expect("gltf_validator");
         assert!(status.success(), "glTF-Validator rejected the export");
-    } else if std::env::var_os("MODELVIEW_REQUIRE_VALIDATOR").is_some() {
+    } else if std::env::var("MODELVIEW_REQUIRE_VALIDATOR").ok().as_deref() == Some("1") {
         panic!("gltf_validator was not on PATH; Linux CI must install the Khronos binary");
     }
 }

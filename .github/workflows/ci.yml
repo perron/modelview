@@ -35,7 +35,8 @@ jobs:
           # Linux runners have no GPU. Lavapipe is the software Vulkan adapter.
           # macOS and Windows try a real adapter and fall back to a software one.
           MODELVIEW_SOFTWARE: ${{ runner.os == 'Linux' && '1' || '0' }}
-          MODELVIEW_REQUIRE_VALIDATOR: ${{ runner.os == 'Linux' && '1' || '' }}
+          # "0" on macOS and Windows: an empty value is still a set variable.
+          MODELVIEW_REQUIRE_VALIDATOR: ${{ runner.os == 'Linux' && '1' || '0' }}
           RUST_BACKTRACE: "1"
       - name: Sample renders for the PR
         shell: bash

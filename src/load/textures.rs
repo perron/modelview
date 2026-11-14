@@ -152,14 +152,30 @@ mod tests {
             .resolved
             .unwrap_or_else(|| panic!("texture was not found; searched {:?}", found.searched));
         assert_eq!(fs::read(&resolved).unwrap(), b"png");
-        // macOS and Windows fold case in the filesystem, so the first relative
-        // candidate already exists and the search list stays short. Linux has
-        // to miss that path and scan the folder.
+        assert_eq!(
+            resolved
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+            "checker.png"
+        );
+        // macOS and Windows fold case, so Textures/Checker.PNG exists on the
+        // first try and the directory scan never runs. A case-sensitive
+        // volume misses that path and must record the scan that finds
+        // textures/checker.png.
         if filesystem_is_case_sensitive(&dir) {
             assert!(
-                found.searched.len() > 1,
-                "case-sensitive search should record the misses: {:?}",
+                found
+                    .searched
+                    .iter()
+                    .any(|entry| entry.contains("case-insensitive")),
+                "case-sensitive search should run the directory scan: {:?}",
                 found.searched
+            );
+            assert_eq!(
+                resolved.file_name().unwrap().to_string_lossy(),
+                "checker.png"
             );
         }
         let _ = fs::remove_dir_all(&dir);
