@@ -239,16 +239,23 @@ fn pid_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+            fn GetExitCodeProcess(handle: *mut core::ffi::c_void, code: *mut u32) -> i32;
+            fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+            fn GetLastError() -> u32;
+        }
         unsafe {
-            // PROCESS_QUERY_LIMITED_INFORMATION. A null handle with access
-            // denied still means some process owns the pid.
-            let handle = libc::OpenProcess(0x1000, 0, pid);
+            // PROCESS_QUERY_LIMITED_INFORMATION. Access denied still means
+            // some process owns the pid.
+            let handle = OpenProcess(0x1000, 0, pid);
             if handle.is_null() {
-                return std::io::Error::last_os_error().raw_os_error() == Some(5);
+                return GetLastError() == 5;
             }
-            let mut code: u32 = 0;
-            let ok = libc::GetExitCodeProcess(handle, &mut code);
-            libc::CloseHandle(handle);
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
             ok != 0 && code == 259
         }
     }
