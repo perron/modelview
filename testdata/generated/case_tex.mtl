@@ -1,0 +1,3 @@
+newmtl checker
+Kd 0.8 0.8 0.8
+map_Kd Textures/Checker.PNG

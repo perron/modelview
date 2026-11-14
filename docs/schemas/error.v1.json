@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "modelview/error/v1",
+  "title": "modelview error",
+  "type": "object",
+  "required": ["schema", "ok", "code", "message"],
+  "properties": {
+    "schema": { "const": "modelview/error/v1" },
+    "ok": { "const": false },
+    "code": {
+      "type": "string",
+      "description": "Stable code. FILE_NOT_FOUND, PARSE_FAILED, TIMEOUT, TEXTURE_MISSING, TEXTURE_ABSOLUTE_PATH, TEXTURE_DECODE_FAILED, PERMISSION_DENIED, INVALID_ARGUMENT, IO_ERROR, RENDER_FAILED, EXPORT_FAILED."
+    },
+    "message": { "type": "string" }
+  }
+}

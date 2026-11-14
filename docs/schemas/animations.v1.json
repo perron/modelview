@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "modelview/animations/v1",
+  "title": "modelview list-animations",
+  "type": "object",
+  "required": ["schema", "ok", "file", "animations"],
+  "properties": {
+    "schema": { "const": "modelview/animations/v1" },
+    "ok": { "type": "boolean" },
+    "file": { "type": "string" },
+    "animations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "duration", "fps"],
+        "properties": {
+          "name": { "type": "string" },
+          "duration": { "type": "number" },
+          "fps": { "type": "number" },
+          "tracks": { "type": "integer" }
+        }
+      }
+    }
+  }
+}

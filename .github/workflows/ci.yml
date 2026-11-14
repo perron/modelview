@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
+      - name: Khronos glTF-Validator
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL -o /tmp/gltf_validator.tar.xz -L \
+            https://github.com/KhronosGroup/glTF-Validator/releases/download/2.0.0-dev.3.10/gltf_validator-2.0.0-dev.3.10-linux64.tar.xz
+          tar -C /tmp -xf /tmp/gltf_validator.tar.xz
+          sudo install -m 0755 /tmp/gltf_validator /usr/local/bin/gltf_validator
+          gltf_validator -h || true
+      - name: Unit and corpus tests
+        shell: bash
+        run: cargo test -- --test-threads=8
+        env:
+          # Linux runners have no GPU. Lavapipe is the software Vulkan adapter.
+          # macOS and Windows try a real adapter and fall back to a software one.
+          MODELVIEW_SOFTWARE: ${{ runner.os == 'Linux' && '1' || '0' }}
+          MODELVIEW_REQUIRE_VALIDATOR: ${{ runner.os == 'Linux' && '1' || '' }}
+          RUST_BACKTRACE: "1"
+      - name: Sample renders for the PR
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            BIN="target/debug/modelview.exe"
+          else
+            BIN="target/debug/modelview"
+          fi
+          mkdir -p artifacts/renders
+          "$BIN" render testdata/generated/cube.obj -o artifacts/renders/cube.png --view three-quarter --size 256x256 --json > artifacts/renders/cube.json
+          "$BIN" render testdata/khronos/BoxTextured/BoxTextured.glb -o artifacts/renders/box.png --view front --size 256x256 --json > artifacts/renders/box.json
+          "$BIN" render testdata/ufbx/blender_279_sausage_7400_binary.fbx -o artifacts/renders/sausage.png --view three-quarter --size 320x320 --anim "Skeleton|Spin" --time 0.4 --json > artifacts/renders/sausage.json
+          "$BIN" render testdata/generated/cube.obj -o artifacts/renders/wire.png --view three-quarter --size 256x256 --mode wireframe --json > artifacts/renders/wire.json
+          "$BIN" turntable testdata/generated/cube.obj -o artifacts/renders/turntable.png --frames 8 --size 128x128 --json > artifacts/renders/turntable.json
+          "$BIN" info testdata/ufbx/blender_279_sausage_6100_ascii.fbx --json > artifacts/renders/sausage-6100-info.json
+        env:
+          MODELVIEW_SOFTWARE: ${{ runner.os == 'Linux' && '1' || '0' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renders-${{ runner.os }}
+          path: artifacts/renders
+          if-no-files-found: error
+
+  package-macos:
+    name: macOS universal package
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build universal binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/modelview \
+            target/x86_64-apple-darwin/release/modelview \
+            -output dist/modelview
+          lipo -info dist/modelview
+          file dist/modelview
+      - name: Unsigned .app, zip, and dmg
+        run: |
+          APP="dist/Modelview.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp dist/modelview "$APP/Contents/MacOS/modelview"
+          cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
+          chmod +x "$APP/Contents/MacOS/modelview"
+          ditto -c -k --keepParent "$APP" dist/modelview-macos-universal.zip
+          hdiutil create -volname modelview -srcfolder "$APP" -ov -format UDZO dist/modelview-macos-universal.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modelview-macos-universal
+          path: |
+            dist/modelview-macos-universal.zip
+            dist/modelview-macos-universal.dmg
+
+  package-windows:
+    name: Windows package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/modelview.exe dist/modelview.exe
+          Compress-Archive -Path dist/modelview.exe -DestinationPath dist/modelview-windows-x64.zip
+      - name: NSIS installer
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install nsis -y
+          $src = (Resolve-Path "target\release\modelview.exe").Path
+          & "C:\Program Files (x86)\NSIS\makensis.exe" "/DSOURCE=$src" packaging\windows\modelview.nsi
+          Move-Item packaging\windows\modelview-0.1.0-windows-x64-setup.exe dist\
+          Get-Item dist\modelview-0.1.0-windows-x64-setup.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modelview-windows-x64
+          path: dist/*
+          if-no-files-found: error

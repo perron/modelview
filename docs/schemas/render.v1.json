@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "modelview/render/v1",
+  "title": "modelview render",
+  "type": "object",
+  "required": ["schema", "ok", "width", "height", "view", "mode", "adapter"],
+  "properties": {
+    "schema": { "const": "modelview/render/v1" },
+    "ok": { "type": "boolean" },
+    "output": { "type": "string" },
+    "width": { "type": "integer" },
+    "height": { "type": "integer" },
+    "view": { "type": "string" },
+    "yaw": { "type": "number" },
+    "pitch": { "type": "number" },
+    "mode": { "type": "string" },
+    "animation": { "type": ["string", "null"] },
+    "time": { "type": "number" },
+    "adapter": { "type": "string", "description": "wgpu adapter name, backend, and device type. CI on Linux reports llvmpipe." }
+  }
+}
