@@ -23,7 +23,12 @@ pub fn run(file: Option<PathBuf>) -> i32 {
             Ok(Box::new(Viewer::new(file)))
         }),
     ) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // A quit during a Desktop permission prompt must not leave the
+            // temp directory the loader created before the read returned.
+            crate::load::cleanup_active_temp();
+            0
+        }
         Err(err) => {
             eprintln!("modelview: {err}");
             2
@@ -53,11 +58,15 @@ struct Viewer {
     recent: Vec<PathBuf>,
     view_image: Option<egui::TextureHandle>,
     cache_key: u64,
+    /// Path waiting until the interface has been drawn. File I/O starts only
+    /// after that, so a macOS privacy prompt cannot block the first frame.
+    pending: Option<PathBuf>,
+    interface_drawn: bool,
 }
 
 impl Viewer {
     fn new(file: Option<PathBuf>) -> Self {
-        let mut viewer = Self {
+        let viewer = Self {
             scene: None,
             error: None,
             loading: None,
@@ -79,10 +88,9 @@ impl Viewer {
             recent: Vec::new(),
             view_image: None,
             cache_key: 0,
+            pending: file,
+            interface_drawn: false,
         };
-        if let Some(path) = file {
-            viewer.start_load(path);
-        }
         viewer
     }
 
@@ -141,7 +149,7 @@ impl Viewer {
             .add_filter("3D models", &["fbx", "gltf", "glb", "obj", "stl", "ply"])
             .pick_file()
         {
-            self.start_load(path);
+            self.pending = Some(path);
         }
     }
 }
@@ -157,7 +165,7 @@ impl eframe::App for Viewer {
                 .collect()
         });
         if let Some(path) = dropped.into_iter().next() {
-            self.start_load(path);
+            self.pending = Some(path);
         }
         if ui.input(|i| i.key_pressed(egui::Key::F)) {
             self.yaw = 35.0;
@@ -196,6 +204,26 @@ impl eframe::App for Viewer {
             self.timeline(ui);
             self.problems(ui);
         });
+        // The widgets above are already recorded. Starting the read on the
+        // next frame lets this one present before a Desktop open() can stall.
+        if io_allowed_this_frame(&mut self.interface_drawn) {
+            if let Some(path) = self.pending.take() {
+                self.start_load(path);
+            }
+        } else {
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+/// File reads wait until a frame has been drawn. The first call returns false
+/// and arms the gate; later calls return true.
+pub(crate) fn io_allowed_this_frame(interface_drawn: &mut bool) -> bool {
+    if *interface_drawn {
+        true
+    } else {
+        *interface_drawn = true;
+        false
     }
 }
 
@@ -213,7 +241,7 @@ impl Viewer {
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| path.display().to_string());
                     if ui.button(label).clicked() {
-                        self.start_load(path);
+                        self.pending = Some(path);
                     }
                 }
             });
@@ -272,6 +300,8 @@ impl Viewer {
         });
         if let Some(path) = &self.loading {
             ui.label(format!("Loading {path}"));
+        } else if let Some(path) = &self.pending {
+            ui.label(format!("Loading {}", path.display()));
         }
     }
 
@@ -316,10 +346,17 @@ impl Viewer {
             return;
         }
         let Some(scene) = self.scene.clone() else {
+            let message = if let Some(path) = self.loading.as_ref() {
+                format!("Loading {path}")
+            } else if let Some(path) = self.pending.as_ref() {
+                format!("Loading {}", path.display())
+            } else {
+                "Open a model, or drop one here".into()
+            };
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "Open a model, or drop one here",
+                message,
                 egui::FontId::proportional(18.0),
                 egui::Color32::GRAY,
             );
@@ -604,7 +641,15 @@ impl Viewer {
         egui::ScrollArea::vertical()
             .max_height(110.0)
             .show(ui, |ui| {
-                let Some(scene) = &self.scene else { return };
+                if let Some(err) = &self.error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, err.to_string());
+                }
+                let Some(scene) = &self.scene else {
+                    if self.loading.is_some() || self.pending.is_some() {
+                        ui.label("Loading");
+                    }
+                    return;
+                };
                 if scene.problems.is_empty() {
                     ui.label("None");
                     return;
@@ -655,6 +700,19 @@ fn draw_node(
     }
     for &child in &node.children {
         draw_node(ui, scene, child, depth + 1, selected);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::io_allowed_this_frame;
+
+    #[test]
+    fn file_read_waits_until_the_interface_has_been_drawn() {
+        let mut drawn = false;
+        assert!(!io_allowed_this_frame(&mut drawn));
+        assert!(drawn);
+        assert!(io_allowed_this_frame(&mut drawn));
     }
 }
 

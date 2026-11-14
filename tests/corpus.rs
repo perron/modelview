@@ -401,6 +401,71 @@ fn mcp_lists_tools_and_refuses_paths_outside_allow() {
 }
 
 #[test]
+fn a_blank_render_is_render_empty() {
+    let scene = modelview::Scene::new("obj");
+    let mut renderer = modelview::render::Renderer::new().expect("renderer");
+    let image = renderer
+        .render_rgba(&modelview::render::FrameRequest {
+            scene: &scene,
+            width: 64,
+            height: 64,
+            yaw: 0.0,
+            pitch: 0.0,
+            mode: modelview::render::RenderMode::Shaded,
+            anim: None,
+            time: 0.0,
+            uv_set: 0,
+            bone: None,
+            show_skeleton: false,
+            show_grid: false,
+            distance_scale: 1.0,
+            target_offset: [0.0, 0.0, 0.0],
+        })
+        .expect("render");
+    assert!(
+        modelview::render::image_is_empty(&image),
+        "a frame with nothing to draw must be a solid colour"
+    );
+    let err = modelview::MvError::new(
+        "RENDER_EMPTY",
+        "render produced a blank image. The mesh may be off camera or zero size",
+    );
+    assert_eq!(err.code, "RENDER_EMPTY");
+    assert_eq!(modelview::error::exit_code(&err), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_during_load_removes_the_temp_dir() {
+    let mut child = Command::new(bin())
+        .args(["info", "testdata/generated/cube.obj", "--json"])
+        .env("MODELVIEW_STAGE_SLEEP_MS", "4000")
+        .env("MODELVIEW_SOFTWARE", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    let status = child.wait().unwrap();
+    assert_ne!(
+        status.code(),
+        Some(0),
+        "SIGTERM should not look like success"
+    );
+    let prefix = format!("modelview-{pid}-");
+    let left = std::env::temp_dir()
+        .read_dir()
+        .unwrap()
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix));
+    assert!(!left, "temp dir survived SIGTERM");
+}
+
+#[test]
 fn load_worker_exits_when_the_parent_pipe_closes() {
     let out = std::env::temp_dir().join(format!("modelview-pipe-{}.bin", std::process::id()));
     let _ = fs::remove_file(&out);

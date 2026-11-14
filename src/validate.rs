@@ -101,6 +101,39 @@ pub fn add_geometry_problems(scene: &mut Scene) {
     flag_mesh_skeleton_mismatch(scene);
 }
 
+/// A skinned scene only a couple of centimetres tall (or tens of metres tall)
+/// is reported, not rescaled. BG3 and some rigged exports really are that
+/// size once the file's centimetre unit is applied, and they match their
+/// skeleton and ufbx's own skinned positions.
+/// `100.4` prints as `100`, and a ratio of about `0.01` is never printed as `0`.
+fn format_ratio(ratio: f32) -> String {
+    let ratio = if ratio.is_finite() {
+        ratio.max(0.0)
+    } else {
+        0.0
+    };
+    if ratio >= 10.0 {
+        format!("{ratio:.0}")
+    } else {
+        format!("{ratio:.1}")
+    }
+}
+
+pub fn flag_unusual_scale(scene: &mut Scene) {
+    if scene.bone_count() == 0 || !scene.bounds.is_valid() {
+        return;
+    }
+    let extent = scene.bounds.max_extent();
+    if extent < 0.05 || extent > 100.0 {
+        scene.add_problem(Problem::info(
+            "UNUSUAL_SCALE",
+            format!(
+                "skinned scene is {extent:.4} m across after converting the file's units to meters. That is the size in the file; it was not rescaled"
+            ),
+        ));
+    }
+}
+
 /// A skinned mesh that is tens of times smaller or larger than the skeleton
 /// is the centimeter-bind failure: the bones are full size and the mesh is a
 /// blob at the root. Accessories that are merely smaller than the body stay
@@ -154,12 +187,15 @@ fn flag_mesh_skeleton_mismatch(scene: &mut Scene) {
         } else {
             1.0
         };
-        if against_vertices >= 8.0 || posed / raw_extent.max(1e-8) >= 8.0 {
+        let grown = posed / raw_extent.max(1e-8);
+        if against_vertices >= 8.0 || grown >= 8.0 {
+            let ratio = against_vertices.max(grown);
             scene.add_problem(Problem::warning(
                 "MESH_SKELETON_MISMATCH",
                 format!(
-                    "skinned mesh '{}' is {posed:.4} m across but its bind-pose vertices are {raw_extent:.4} m ({against_vertices:.0}x). The bind matrix and the bone transforms are not in the same scale",
-                    mesh.name
+                    "skinned mesh '{}' is {posed:.4} m across but its bind-pose vertices are {raw_extent:.4} m ({}x). The bind matrix and the bone transforms are not in the same scale",
+                    mesh.name,
+                    format_ratio(ratio),
                 ),
             ));
         }
@@ -171,7 +207,8 @@ fn flag_mesh_skeleton_mismatch(scene: &mut Scene) {
         scene.add_problem(Problem::warning(
             "MESH_SKELETON_MISMATCH",
             format!(
-                "skinned mesh '{largest_name}' is {largest_posed:.4} m across and the skeleton is {skeleton_extent:.4} m ({ratio:.0}x). The bind matrix and the bone transforms are not in the same scale"
+                "skinned mesh '{largest_name}' is {largest_posed:.4} m across and the skeleton is {skeleton_extent:.4} m ({}x). The bind matrix and the bone transforms are not in the same scale",
+                format_ratio(ratio),
             ),
         ));
     }
@@ -224,6 +261,54 @@ mod tests {
             "{:?}",
             scene.problems
         );
+    }
+
+    #[test]
+    fn a_hundredfold_mismatch_does_not_print_as_zero() {
+        let mut scene = Scene::new("fbx");
+        scene.nodes.push(Node {
+            name: "hips".into(),
+            parent: None,
+            children: vec![1],
+            rest: Trs::identity(),
+            meshes: vec![0],
+            is_bone: true,
+        });
+        let mut head = Trs::identity();
+        head.translation = [0.0, 1.7, 0.0];
+        scene.nodes.push(Node {
+            name: "head".into(),
+            parent: Some(0),
+            children: vec![],
+            rest: head,
+            meshes: vec![],
+            is_bone: true,
+        });
+        let mut mesh = Mesh::new("V4_Spikes2_Crest");
+        mesh.positions = vec![[0.0, 0.0, 0.0], [0.0028, 0.0, 0.0], [0.0, 0.0014, 0.0]];
+        mesh.indices = vec![0, 1, 2];
+        mesh.joints = vec![[0, 0, 0, 0]; 3];
+        mesh.weights = vec![[1.0, 0.0, 0.0, 0.0]; 3];
+        mesh.skin = Some(0);
+        scene.meshes.push(mesh);
+        let scale = glam::Mat4::from_scale(glam::Vec3::splat(100.0)).to_cols_array();
+        scene.skins.push(Skin {
+            name: "skin".into(),
+            joints: vec![0],
+            inverse_bind: vec![scale],
+        });
+        add_geometry_problems(&mut scene);
+        let message = scene
+            .problems
+            .iter()
+            .find(|p| p.code == "MESH_SKELETON_MISMATCH" && p.message.contains("bind-pose"))
+            .map(|p| p.message.as_str())
+            .unwrap_or("");
+        assert!(
+            message.contains("100x"),
+            "ratio was rounded away: {message}"
+        );
+        assert!(!message.contains("(0x)"), "{message}");
     }
 }
 

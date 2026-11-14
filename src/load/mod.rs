@@ -9,6 +9,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -20,6 +22,36 @@ use crate::validate;
 pub use self::obj::parse_obj;
 
 const DEFAULT_MEMORY_MB: u64 = 2048;
+
+static STOP_LOAD: AtomicBool = AtomicBool::new(false);
+static ACTIVE_TEMP: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn stop_requested() -> bool {
+    STOP_LOAD.load(Ordering::Relaxed)
+}
+
+/// Remove the temp directory the in-flight load created. Called when the
+/// window exits, including while a Desktop read is still blocked.
+pub fn cleanup_active_temp() {
+    let Some(dir) = ACTIVE_TEMP.lock().ok().and_then(|mut g| g.take()) else {
+        return;
+    };
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn remember_temp(dir: &Path) {
+    if let Ok(mut guard) = ACTIVE_TEMP.lock() {
+        *guard = Some(dir.to_path_buf());
+    }
+}
+
+fn forget_temp(dir: &Path) {
+    if let Ok(mut guard) = ACTIVE_TEMP.lock() {
+        if guard.as_ref().is_some_and(|p| p == dir) {
+            *guard = None;
+        }
+    }
+}
 
 /// Load in this process. The CLI and MCP server do not call this directly;
 /// they spawn a child so a bad file cannot take the parent down. Tests call
@@ -55,6 +87,7 @@ pub fn load_in_process(path: &Path) -> Result<Scene> {
     scene.source.sha256 = sha256_file(path)?;
     validate::add_geometry_problems(&mut scene);
     scene.recompute_bounds();
+    validate::flag_unusual_scale(&mut scene);
     Ok(scene)
 }
 
@@ -64,8 +97,9 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
     if !path.is_file() {
         return Err(MvError::file_not_found(path.display()));
     }
-    // A killed parent cannot run its Drop guard, so a previous load can leave
-    // modelview-<pid>-*/model.fbx behind. Sweep those before making a new one.
+    // A killed parent cannot run its Drop guard. Sweep leftovers whose owning
+    // pid is dead, even when the directory is only a few seconds old.
+    install_stop_handler();
     sweep_stale_temp_dirs();
     let exe = std::env::current_exe().map_err(MvError::io)?;
     let stamp = SystemTime::now()
@@ -74,20 +108,22 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
         .unwrap_or(0);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("bin");
     let dir = std::env::temp_dir().join(format!("modelview-{}-{stamp}", std::process::id()));
-    fs::create_dir_all(&dir).map_err(MvError::io)?;
+    fs::create_dir_all(&dir).map_err(|err| file_error(err, &dir))?;
+    remember_temp(&dir);
+    let _session = TempSession(dir.clone());
+    pause_for_stage_test(&dir);
     let out = dir.join("scene.bin");
     // macOS privacy prompts are attributed to the process that opens a
-    // Desktop/Documents/Downloads file. Read and copy there so the prompt
-    // names this app. Other platforms hand the worker the original path.
+    // Desktop/Documents/Downloads file. Link or clone it here so the prompt
+    // names this app and we do not write a second full copy. Other platforms
+    // hand the worker the original path.
     let src = if cfg!(target_os = "macos") {
-        let file_bytes = fs::read(path).map_err(|err| {
-            let _ = fs::remove_dir_all(&dir);
-            MvError::io(err)
-        })?;
         let src = dir.join(format!("model.{ext}"));
-        if let Err(err) = fs::write(&src, &file_bytes) {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(MvError::io(err));
+        if let Err(err) = stage_model(path, &src) {
+            if stop_requested() {
+                stop_and_exit(&dir);
+            }
+            return Err(file_error(err, path));
         }
         if ext.eq_ignore_ascii_case("obj") {
             copy_obj_sidecars(path, &src);
@@ -116,10 +152,16 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
     let status = match wait_child(&mut child, timeout) {
         Ok(status) => status,
         Err(err) => {
+            if stop_requested() {
+                stop_and_exit(&dir);
+            }
             let _ = fs::remove_dir_all(&dir);
             return Err(err);
         }
     };
+    if stop_requested() {
+        stop_and_exit(&dir);
+    }
     // Dropping the child closes the pipe if the worker is somehow still alive.
     drop(child);
     let bytes = fs::read(&out).unwrap_or_default();
@@ -138,8 +180,10 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
     Ok(scene)
 }
 
-/// Delete `modelview-*` temp dirs and files left by a parent that was killed
-/// mid-load. Anything touched in the last 10 minutes is left alone.
+/// Delete `modelview-<pid>-*` leftovers. A directory whose pid is no longer
+/// alive is removed immediately. A live owner's directory waits 10 minutes,
+/// and the listing's metadata is used so Windows does not have to open the
+/// directory.
 fn sweep_stale_temp_dirs() {
     let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
         return;
@@ -147,21 +191,21 @@ fn sweep_stale_temp_dirs() {
     let cutoff = SystemTime::now()
         .checked_sub(Duration::from_secs(10 * 60))
         .unwrap_or(SystemTime::UNIX_EPOCH);
+    let current = std::process::id();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.starts_with("modelview-") {
             continue;
         }
-        // `DirEntry::metadata` comes from the directory listing. Opening the
-        // directory itself fails on Windows without FILE_FLAG_BACKUP_SEMANTICS.
         let Ok(meta) = entry.metadata() else {
             continue;
         };
-        let Ok(modified) = meta.modified() else {
-            continue;
-        };
-        if modified >= cutoff {
+        let dead_owner = temp_owner_pid(&name)
+            .map(|pid| pid != current && !pid_alive(pid))
+            .unwrap_or(false);
+        let old = meta.modified().ok().map(|t| t < cutoff).unwrap_or(false);
+        if !dead_owner && !old {
             continue;
         }
         if meta.is_dir() {
@@ -170,6 +214,141 @@ fn sweep_stale_temp_dirs() {
             let _ = fs::remove_file(entry.path());
         }
     }
+}
+
+/// `modelview-<pid>-<stamp>`. Names like `modelview-stale-...` have no pid.
+fn temp_owner_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("modelview-")?;
+    let pid = rest.split('-').next()?;
+    let pid = pid.parse::<u32>().ok()?;
+    if pid == 0 {
+        None
+    } else {
+        Some(pid)
+    }
+}
+
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        if rc == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        unsafe {
+            // PROCESS_QUERY_LIMITED_INFORMATION. A null handle with access
+            // denied still means some process owns the pid.
+            let handle = libc::OpenProcess(0x1000, 0, pid);
+            if handle.is_null() {
+                return std::io::Error::last_os_error().raw_os_error() == Some(5);
+            }
+            let mut code: u32 = 0;
+            let ok = libc::GetExitCodeProcess(handle, &mut code);
+            libc::CloseHandle(handle);
+            ok != 0 && code == 259
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+struct TempSession(PathBuf);
+
+impl Drop for TempSession {
+    fn drop(&mut self) {
+        forget_temp(&self.0);
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn file_error(err: std::io::Error, path: &Path) -> MvError {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        MvError::permission(format!(
+            "permission denied reading {}. If this file is in Desktop, Documents, or Downloads, allow modelview in the system's privacy settings",
+            path.display()
+        ))
+    } else {
+        MvError::io(format!("{}: {err}", path.display()))
+    }
+}
+
+/// Link the model into the temp directory. A hard link (or an APFS clone on
+/// macOS) avoids writing the file out a second time. A full copy is the fallback.
+fn stage_model(original: &Path, dest: &Path) -> std::io::Result<()> {
+    if fs::hard_link(original, dest).is_ok() {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if clone_file(original, dest).is_ok() {
+            return Ok(());
+        }
+    }
+    fs::copy(original, dest).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file(original: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let src = std::ffi::CString::new(original.as_os_str().as_bytes())
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let dst = std::ffi::CString::new(dest.as_os_str().as_bytes())
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let rc = unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn pause_for_stage_test(dir: &Path) {
+    let Ok(text) = std::env::var("MODELVIEW_STAGE_SLEEP_MS") else {
+        return;
+    };
+    let Ok(ms) = text.parse::<u64>() else {
+        return;
+    };
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(ms) {
+        if stop_requested() {
+            stop_and_exit(dir);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn stop_and_exit(dir: &Path) -> ! {
+    forget_temp(dir);
+    let _ = fs::remove_dir_all(dir);
+    std::process::exit(130);
+}
+
+fn install_stop_handler() {
+    #[cfg(unix)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handle_stop as *const () as libc::sighandler_t;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+            libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        });
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn handle_stop(_: libc::c_int) {
+    STOP_LOAD.store(true, Ordering::Relaxed);
 }
 
 /// OBJ materials and textures are read in this process, next to the original
@@ -383,6 +562,14 @@ pub fn wait_child(child: &mut Child, timeout: Duration) -> Result<std::process::
         if let Some(status) = child.try_wait().map_err(MvError::io)? {
             return Ok(status);
         }
+        if stop_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MvError::new(
+                "INTERRUPTED",
+                "loader was stopped because the process was asked to quit",
+            ));
+        }
         if start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();
@@ -433,6 +620,22 @@ fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(hex(&hasher.finalize()))
+}
+
+fn long_sleeper() -> Child {
+    #[cfg(windows)]
+    {
+        Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("sleep").arg("30").spawn().unwrap()
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -538,5 +741,58 @@ mod tests {
         assert!(!stale.exists(), "stale temp dir should be gone");
         assert!(fresh.exists(), "a temp dir from this run should stay");
         let _ = fs::remove_dir_all(&fresh);
+    }
+
+    #[test]
+    fn a_dead_owners_temp_dir_is_removed_immediately() {
+        let mut child = super::long_sleeper();
+        let pid = child.id();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!pid_alive(pid), "pid {pid} still looks alive");
+        let dir = std::env::temp_dir().join(format!("modelview-{pid}-dead"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("model.fbx"), b"leftover").unwrap();
+        let mine = std::env::temp_dir().join(format!("modelview-{}-live", std::process::id()));
+        let _ = fs::remove_dir_all(&mine);
+        fs::create_dir_all(&mine).unwrap();
+        sweep_stale_temp_dirs();
+        assert!(!dir.exists(), "dead owner's temp dir should be gone");
+        assert!(mine.exists(), "this process's temp dir should stay");
+        let _ = fs::remove_dir_all(&mine);
+    }
+
+    #[test]
+    fn stage_model_links_instead_of_copying_bytes() {
+        let dir = std::env::temp_dir().join(format!("mv-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("model.fbx");
+        fs::write(&src, b"not-a-real-fbx").unwrap();
+        let dest = dir.join("linked.fbx");
+        stage_model(&src, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"not-a-real-fbx");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(&src).unwrap().ino(),
+                fs::metadata(&dest).unwrap().ino(),
+                "stage_model should hard-link on the same volume"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permission_denied_names_the_file() {
+        let err = file_error(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            Path::new("/Users/x/Desktop/Kobold.fbx"),
+        );
+        assert_eq!(err.code, "PERMISSION_DENIED");
+        assert!(err.message.contains("Kobold.fbx"), "{}", err.message);
+        assert!(err.message.contains("privacy"), "{}", err.message);
     }
 }

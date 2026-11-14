@@ -901,6 +901,67 @@ Connections:  {{
         );
     }
 
+    fn ufbx_skin_extent(path: &std::path::Path) -> f32 {
+        let path_str = path.to_str().unwrap();
+        let mut opts = ufbx::LoadOpts::default();
+        opts.target_unit_meters = 1.0;
+        opts.target_axes = ufbx::CoordinateAxes::right_handed_y_up();
+        opts.space_conversion = ufbx::SpaceConversion::ModifyGeometry;
+        opts.geometry_transform_handling = ufbx::GeometryTransformHandling::ModifyGeometry;
+        let loaded = ufbx::load_file(path_str, opts).unwrap();
+        let mesh = &loaded.meshes[0];
+        let node = &mesh.element.instances[0];
+        let mut min = [f32::MAX; 3];
+        let mut max = [f32::MIN; 3];
+        for corner in 0..mesh.num_indices {
+            let local = mesh.skinned_position[corner];
+            let pos = ufbx::transform_position(&node.geometry_to_world, local);
+            let p = [pos.x as f32, pos.y as f32, pos.z as f32];
+            for c in 0..3 {
+                min[c] = min[c].min(p[c]);
+                max[c] = max[c].max(p[c]);
+            }
+        }
+        (0..3).map(|c| max[c] - min[c]).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn tiny_file_matches_ufbx_and_is_not_rescaled() {
+        let dir = std::env::temp_dir().join(format!("mv-tiny-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // 2cm column. Same cluster shape as the metre fixture, translations in centimetres.
+        let text = cm_skinned_fbx(1.0)
+            .replace(
+                "-10,0,0, 10,0,0, 10,180,0, -10,180,0",
+                "-1,0,0, 1,0,0, 1,2,0, -1,2,0",
+            )
+            .replace("0,170,0", "0,1.7,0")
+            .replace("0,-90,0,1", "0,-1,0,1");
+        let path = dir.join("tiny.fbx");
+        fs::write(&path, text).unwrap();
+        let mut scene = load(&path).unwrap();
+        scene.recompute_bounds();
+        crate::validate::add_geometry_problems(&mut scene);
+        crate::validate::flag_unusual_scale(&mut scene);
+        let extent = scene.bounds.max_extent();
+        let ufbx_extent = ufbx_skin_extent(&path);
+        assert!(
+            (extent - ufbx_extent).abs() < 0.005,
+            "our extent {extent} ufbx {ufbx_extent}"
+        );
+        assert!(
+            (0.01..0.05).contains(&extent),
+            "tiny file was rescaled to {extent}"
+        );
+        assert!(
+            scene.problems.iter().any(|p| p.code == "UNUSUAL_SCALE"),
+            "{:?}",
+            scene.problems
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn version_7700_ascii_and_uv_sets() {
         let file = load(&corpus("synthetic_direct_by_polygon_7700_ascii.fbx")).unwrap();
