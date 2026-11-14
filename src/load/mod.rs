@@ -153,6 +153,8 @@ fn sweep_stale_temp_dirs() {
         if !name.starts_with("modelview-") {
             continue;
         }
+        // `DirEntry::metadata` comes from the directory listing. Opening the
+        // directory itself fails on Windows without FILE_FLAG_BACKUP_SEMANTICS.
         let Ok(meta) = entry.metadata() else {
             continue;
         };
@@ -527,9 +529,11 @@ mod tests {
         fs::create_dir_all(&stale).unwrap();
         fs::create_dir_all(&fresh).unwrap();
         fs::write(stale.join("model.fbx"), b"leftover").unwrap();
-        let file = fs::File::open(&stale).unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
-            .unwrap();
+        // `File::open` on a directory is access-denied on Windows. `set_times`
+        // opens it with FILE_WRITE_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS.
+        let times =
+            std::fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(3600));
+        fs::set_times(&stale, times).unwrap();
         sweep_stale_temp_dirs();
         assert!(!stale.exists(), "stale temp dir should be gone");
         assert!(fresh.exists(), "a temp dir from this run should stay");
