@@ -114,9 +114,10 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
     pause_for_stage_test(&dir);
     let out = dir.join("scene.bin");
     // macOS privacy prompts are attributed to the process that opens a
-    // Desktop/Documents/Downloads file. Link or clone it here so the prompt
-    // names this app and we do not write a second full copy. Other platforms
-    // hand the worker the original path.
+    // Desktop/Documents/Downloads file, so this process opens it. A hard link
+    // would change the source file's ctime, which backup tools treat as a
+    // modification, so the source inode is never linked. Other platforms hand
+    // the worker the original path and only read it.
     let src = if cfg!(target_os = "macos") {
         let src = dir.join(format!("model.{ext}"));
         if let Err(err) = stage_model(path, &src) {
@@ -286,19 +287,22 @@ fn file_error(err: std::io::Error, path: &Path) -> MvError {
     }
 }
 
-/// Link the model into the temp directory. A hard link (or an APFS clone on
-/// macOS) avoids writing the file out a second time. A full copy is the fallback.
+/// Put a private copy of `original` at `dest` without changing the source
+/// file's ctime, mtime, or link count.
+///
+/// On APFS, `clonefile` shares the extents and leaves the source inode alone.
+/// A hard link is never used: it increments `nlink` and updates ctime. If
+/// cloning is unavailable, the bytes are read and written to a new file.
 fn stage_model(original: &Path, dest: &Path) -> std::io::Result<()> {
-    if fs::hard_link(original, dest).is_ok() {
-        return Ok(());
-    }
     #[cfg(target_os = "macos")]
     {
         if clone_file(original, dest).is_ok() {
             return Ok(());
         }
+        let _ = fs::remove_file(dest);
     }
-    fs::copy(original, dest).map(|_| ())
+    let bytes = fs::read(original)?;
+    fs::write(dest, &bytes)
 }
 
 #[cfg(target_os = "macos")]
@@ -629,6 +633,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex(&hasher.finalize()))
 }
 
+#[cfg(test)]
 fn long_sleeper() -> Child {
     #[cfg(windows)]
     {
@@ -653,6 +658,106 @@ fn hex(bytes: &[u8]) -> String {
         out.push(HEX[(b & 0xf) as usize] as char);
     }
     out
+}
+
+/// `(ctime, mtime, nlink)` of `path`. On Windows, `ctime` is the creation time,
+/// which is what `stat` reports there. A load must leave this triple unchanged.
+pub fn source_file_stamp(path: &Path) -> (u128, u128, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(path).unwrap();
+        let ctime = meta.ctime() as u128 * 1_000_000_000 + meta.ctime_nsec() as u128;
+        let mtime = meta.mtime() as u128 * 1_000_000_000 + meta.mtime_nsec() as u128;
+        return (ctime, mtime, meta.nlink());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let meta = fs::metadata(path).unwrap();
+        return (
+            meta.creation_time() as u128,
+            meta.last_write_time() as u128,
+            windows_nlink(path),
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let meta = fs::metadata(path).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        (mtime, mtime, 1)
+    }
+}
+
+#[cfg(windows)]
+fn windows_nlink(path: &Path) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut core::ffi::c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut core::ffi::c_void,
+        ) -> *mut core::ffi::c_void;
+        fn GetFileInformationByHandle(
+            handle: *mut core::ffi::c_void,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+        fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    }
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        _attributes: u32,
+        _creation_low: u32,
+        _creation_high: u32,
+        _access_low: u32,
+        _access_high: u32,
+        _write_low: u32,
+        _write_high: u32,
+        _volume: u32,
+        _size_high: u32,
+        _size_low: u32,
+        links: u32,
+        _index_high: u32,
+        _index_low: u32,
+    }
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        // FILE_READ_ATTRIBUTES, share read/write/delete, OPEN_EXISTING.
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            0x80,
+            0x7,
+            std::ptr::null_mut(),
+            3,
+            0,
+            std::ptr::null_mut(),
+        );
+        if handle as isize == -1 {
+            return 0;
+        }
+        let mut info = std::mem::zeroed::<ByHandleFileInformation>();
+        let ok = GetFileInformationByHandle(handle, &mut info);
+        CloseHandle(handle);
+        if ok == 0 {
+            0
+        } else {
+            info.links as u64
+        }
+    }
 }
 
 pub fn default_timeout() -> Duration {
@@ -771,22 +876,29 @@ mod tests {
     }
 
     #[test]
-    fn stage_model_links_instead_of_copying_bytes() {
-        let dir = std::env::temp_dir().join(format!("mv-link-{}", std::process::id()));
+    fn stage_model_leaves_source_ctime_mtime_and_nlink_alone() {
+        let dir = std::env::temp_dir().join(format!("mv-stage-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let src = dir.join("model.fbx");
         fs::write(&src, b"not-a-real-fbx").unwrap();
-        let dest = dir.join("linked.fbx");
+        let before = super::source_file_stamp(&src);
+        let dest = dir.join("staged.fbx");
         stage_model(&src, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"not-a-real-fbx");
+        assert_eq!(
+            super::source_file_stamp(&src),
+            before,
+            "staging changed the source file's metadata"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            assert_eq!(
+            assert_eq!(before.2, 1, "source gained a link");
+            assert_ne!(
                 fs::metadata(&src).unwrap().ino(),
                 fs::metadata(&dest).unwrap().ino(),
-                "stage_model should hard-link on the same volume"
+                "staging must not hard-link the source"
             );
         }
         let _ = fs::remove_dir_all(&dir);

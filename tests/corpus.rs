@@ -401,6 +401,25 @@ fn mcp_lists_tools_and_refuses_paths_outside_allow() {
 }
 
 #[test]
+fn load_does_not_change_source_ctime_mtime_or_nlink() {
+    let dir = std::env::temp_dir().join(format!("mv-stamp-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("cube.obj");
+    fs::copy("testdata/generated/cube.obj", &src).unwrap();
+    // Copying can itself be followed by a timestamp settle. Capture after the copy.
+    let before = modelview::load::source_file_stamp(&src);
+    let (code, _) = json_stdout(&["info", src.to_str().unwrap(), "--json"]);
+    assert_eq!(code, 0);
+    let after = modelview::load::source_file_stamp(&src);
+    assert_eq!(
+        before, after,
+        "load changed source ctime/mtime/nlink: before {before:?} after {after:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_blank_render_is_render_empty() {
     let scene = modelview::Scene::new("obj");
     let mut renderer = modelview::render::Renderer::new().expect("renderer");
