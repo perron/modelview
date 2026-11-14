@@ -148,9 +148,29 @@ mod tests {
         fs::write(dir.join("model.obj"), b"o x\n").unwrap();
         fs::write(dir.join("textures").join("checker.png"), b"png").unwrap();
         let found = resolve(&dir.join("model.obj"), r"Textures/Checker.PNG");
-        assert!(found.resolved.is_some(), "searched {:?}", found.searched);
-        assert!(found.searched.len() > 1);
+        let resolved = found
+            .resolved
+            .unwrap_or_else(|| panic!("texture was not found; searched {:?}", found.searched));
+        assert_eq!(fs::read(&resolved).unwrap(), b"png");
+        // macOS and Windows fold case in the filesystem, so the first relative
+        // candidate already exists and the search list stays short. Linux has
+        // to miss that path and scan the folder.
+        if filesystem_is_case_sensitive(&dir) {
+            assert!(
+                found.searched.len() > 1,
+                "case-sensitive search should record the misses: {:?}",
+                found.searched
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn filesystem_is_case_sensitive(dir: &Path) -> bool {
+        let upper = dir.join("MVCaseProbe");
+        fs::write(&upper, b"probe").unwrap();
+        let folded = fs::read(dir.join("mvcaseprobe"));
+        let _ = fs::remove_file(&upper);
+        folded.is_err()
     }
 
     #[test]
