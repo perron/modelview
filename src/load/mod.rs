@@ -74,11 +74,10 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("bin");
-    let src = std::env::temp_dir().join(format!(
-        "modelview-src-{}-{stamp}.{ext}",
-        std::process::id()
-    ));
-    let out = std::env::temp_dir().join(format!("modelview-{}-{stamp}.bin", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("modelview-{}-{stamp}", std::process::id()));
+    fs::create_dir_all(&dir).map_err(MvError::io)?;
+    let src = dir.join(format!("model.{ext}"));
+    let out = dir.join("scene.bin");
     fs::write(&src, &file_bytes).map_err(MvError::io)?;
     if ext.eq_ignore_ascii_case("obj") {
         copy_obj_sidecars(path, &src);
@@ -96,31 +95,59 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
-            let _ = fs::remove_file(&src);
+            let _ = fs::remove_dir_all(&dir);
             return Err(MvError::io(err));
         }
     };
     let status = match wait_child(&mut child, timeout) {
         Ok(status) => status,
         Err(err) => {
-            let _ = fs::remove_file(&out);
-            let _ = fs::remove_file(&src);
+            let _ = fs::remove_dir_all(&dir);
             return Err(err);
         }
     };
     // Dropping the child closes the pipe if the worker is somehow still alive.
     drop(child);
     let bytes = fs::read(&out).unwrap_or_default();
-    let _ = fs::remove_file(&out);
-    let _ = fs::remove_file(&src);
+    let _ = fs::remove_dir_all(&dir);
     let mut scene = decode_worker_output(&bytes, status.success())?;
     scene.source.path = path.display().to_string();
     scene.source.file_name = path
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    refresh_external_textures(&mut scene, path);
+    if scene.source.format == "obj" {
+        adopt_obj_materials(&mut scene, path);
+    } else {
+        refresh_external_textures(&mut scene, path);
+    }
     Ok(scene)
+}
+
+/// OBJ materials and textures are read in this process, next to the original
+/// file. The worker's temp copy does not include the `.mtl` or image files.
+fn adopt_obj_materials(scene: &mut Scene, original: &Path) {
+    let Ok(local) = obj::load(original) else {
+        return;
+    };
+    if scene.meshes.len() == local.meshes.len() {
+        for (mesh, src) in scene.meshes.iter_mut().zip(local.meshes.iter()) {
+            mesh.material = src.material;
+        }
+    }
+    scene.materials = local.materials;
+    scene.textures = local.textures;
+    scene
+        .problems
+        .retain(|p| p.code != "TEXTURE_MISSING" && p.code != "TEXTURE_ABSOLUTE_PATH");
+    for problem in local.problems {
+        if matches!(
+            problem.code.as_str(),
+            "TEXTURE_MISSING" | "TEXTURE_ABSOLUTE_PATH" | "TEXTURE_DECODE_FAILED"
+        ) {
+            scene.add_problem(problem);
+        }
+    }
 }
 
 /// `mtllib` files sit next to the OBJ. Copy them beside the temp copy so the
