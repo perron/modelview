@@ -400,6 +400,41 @@ fn mcp_lists_tools_and_refuses_paths_outside_allow() {
     let _ = child.wait();
 }
 
+#[test]
+fn load_worker_exits_when_the_parent_pipe_closes() {
+    let out = std::env::temp_dir().join(format!("modelview-pipe-{}.bin", std::process::id()));
+    let _ = fs::remove_file(&out);
+    let mut child = Command::new(bin())
+        .arg("--load-worker")
+        .arg("testdata/generated/cube.obj")
+        .arg(&out)
+        .arg("256")
+        .env("MODELVIEW_WORKER_SLEEP_MS", "8000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn worker");
+    // Closing the write end is what happens when the app quits.
+    drop(child.stdin.take());
+    let start = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(3) {
+            let _ = child.kill();
+            panic!("worker kept running after the parent pipe closed");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "worker should die when the parent disappears, not after the sleep"
+    );
+    let _ = fs::remove_file(&out);
+}
+
 trait WaitTimeoutLike {
     fn wait_timeout_like(&mut self);
 }

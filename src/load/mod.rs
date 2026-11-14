@@ -64,34 +64,174 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
     if !path.is_file() {
         return Err(MvError::file_not_found(path.display()));
     }
+    // Read the bytes in this process. On macOS a Desktop/Documents/Downloads
+    // file raises the privacy prompt for whoever calls open(); doing it here
+    // attributes the prompt to the app. The worker only sees a temp copy.
+    let file_bytes = fs::read(path).map_err(MvError::io)?;
     let exe = std::env::current_exe().map_err(MvError::io)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+    let src = std::env::temp_dir().join(format!(
+        "modelview-src-{}-{stamp}.{ext}",
+        std::process::id()
+    ));
     let out = std::env::temp_dir().join(format!("modelview-{}-{stamp}.bin", std::process::id()));
+    fs::write(&src, &file_bytes).map_err(MvError::io)?;
+    if ext.eq_ignore_ascii_case("obj") {
+        copy_obj_sidecars(path, &src);
+    }
     let mut cmd = Command::new(exe);
     cmd.arg("--load-worker")
-        .arg(path)
+        .arg(&src)
         .arg(&out)
         .arg(memory_mb.max(64).to_string())
-        .stdin(Stdio::null())
+        // The write end of this pipe stays open until the child is dropped.
+        // Process exit closes it too, and the worker treats EOF as "parent died".
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(MvError::io)?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = fs::remove_file(&src);
+            return Err(MvError::io(err));
+        }
+    };
     let status = match wait_child(&mut child, timeout) {
         Ok(status) => status,
         Err(err) => {
             let _ = fs::remove_file(&out);
+            let _ = fs::remove_file(&src);
             return Err(err);
         }
     };
+    // Dropping the child closes the pipe if the worker is somehow still alive.
+    drop(child);
     let bytes = fs::read(&out).unwrap_or_default();
     let _ = fs::remove_file(&out);
-    decode_worker_output(&bytes, status.success())
+    let _ = fs::remove_file(&src);
+    let mut scene = decode_worker_output(&bytes, status.success())?;
+    scene.source.path = path.display().to_string();
+    scene.source.file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    refresh_external_textures(&mut scene, path);
+    Ok(scene)
+}
+
+/// `mtllib` files sit next to the OBJ. Copy them beside the temp copy so the
+/// worker can see material and texture names. The bytes are read here.
+fn copy_obj_sidecars(original: &Path, temp_obj: &Path) {
+    let Ok(text) = fs::read_to_string(original) else {
+        return;
+    };
+    let Some(dir) = original.parent() else {
+        return;
+    };
+    let Some(temp_dir) = temp_obj.parent() else {
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("mtllib")
+            .or_else(|| line.strip_prefix("MTLLIB"))
+        else {
+            continue;
+        };
+        let name = rest.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let from = dir.join(name);
+        let to = temp_dir.join(name);
+        if let Some(parent) = to.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::copy(&from, &to);
+    }
+}
+
+/// Textures were resolved against the worker's temp copy. Search again next
+/// to the file the user actually opened, in this process.
+fn refresh_external_textures(scene: &mut Scene, original: &Path) {
+    use crate::scene::Problem;
+    scene
+        .problems
+        .retain(|p| p.code != "TEXTURE_MISSING" && p.code != "TEXTURE_ABSOLUTE_PATH");
+    let mut notes = Vec::new();
+    for index in 0..scene.textures.len() {
+        if scene.textures[index].embedded && scene.textures[index].status == "ok" {
+            continue;
+        }
+        let referenced = scene.textures[index].referenced_path.clone();
+        if referenced.is_empty() {
+            continue;
+        }
+        let found = textures::resolve(original, &referenced);
+        scene.textures[index].searched = found.searched.clone();
+        if found.absolute_reference {
+            notes.push(Problem::warning(
+                "TEXTURE_ABSOLUTE_PATH",
+                textures::absolute_path_message(&referenced, &found),
+            ));
+        }
+        if let Some(path) = found.resolved.clone() {
+            match fs::read(&path)
+                .ok()
+                .and_then(|b| textures::decode_bytes(&b))
+            {
+                Some((w, h, rgba)) => {
+                    let tex = &mut scene.textures[index];
+                    tex.resolved_path = Some(path.display().to_string());
+                    tex.status = "ok".into();
+                    tex.width = w;
+                    tex.height = h;
+                    tex.rgba = rgba;
+                    continue;
+                }
+                None => {
+                    scene.textures[index].status = "decode_failed".into();
+                    notes.push(Problem::warning(
+                        "TEXTURE_DECODE_FAILED",
+                        format!("could not decode {}", path.display()),
+                    ));
+                    continue;
+                }
+            }
+        }
+        scene.textures[index].status = "missing".into();
+        scene.textures[index].resolved_path = None;
+        let mut problem = Problem::warning(
+            "TEXTURE_MISSING",
+            format!("texture '{referenced}' was not found"),
+        );
+        problem.path = Some(referenced);
+        problem.searched = found.searched;
+        notes.push(problem);
+    }
+    for problem in notes {
+        scene.add_problem(problem);
+    }
 }
 
 pub fn worker_main(args: &[String]) -> i32 {
+    // Exit as soon as the parent's pipe closes, including when the app quits
+    // while this process is blocked inside a file read.
+    std::thread::spawn(|| {
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 64];
+        loop {
+            match std::io::Read::read(&mut stdin, &mut buf) {
+                Ok(0) | Err(_) => std::process::exit(3),
+                Ok(_) => {}
+            }
+        }
+    });
     let Some(input) = args.get(1) else {
         return 2;
     };

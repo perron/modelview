@@ -131,7 +131,9 @@ pub fn parse_obj(path: &Path, text: &str) -> Result<Scene> {
             roughness: (1.0 - (mtl.ns / 200.0).clamp(0.0, 1.0)).clamp(0.15, 1.0),
             base_color_texture: None,
             shading_model: "obj-mtl".into(),
-            double_sided: true,
+            // Opaque OBJ materials are single sided. Drawing both sides of a
+            // shell z-fights and reads as speckled holes.
+            double_sided: mtl.d < 0.99,
         };
         if let Some(map) = &mtl.map_kd {
             material.base_color_texture = Some(push_texture(&mut scene, path, map));
@@ -251,7 +253,7 @@ fn push_texture(scene: &mut Scene, model: &Path, referenced: &str) -> usize {
     if found.absolute_reference {
         scene.add_problem(Problem::warning(
             "TEXTURE_ABSOLUTE_PATH",
-            format!("texture '{referenced}' uses an absolute path"),
+            textures::absolute_path_message(referenced, &found),
         ));
     }
     if let Some(path) = &found.resolved {

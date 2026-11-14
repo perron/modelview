@@ -102,6 +102,23 @@ pub fn resolve(model_path: &Path, referenced: &str) -> ResolveResult {
     }
 }
 
+pub fn absolute_path_message(referenced: &str, found: &ResolveResult) -> String {
+    let looked = if found.searched.is_empty() {
+        "nowhere".to_string()
+    } else {
+        found.searched.join("; ")
+    };
+    match &found.resolved {
+        Some(path) => format!(
+            "texture '{referenced}' is an absolute path from another machine; using '{}' (looked at {looked})",
+            path.display()
+        ),
+        None => format!(
+            "texture '{referenced}' is an absolute path from another machine and was not found (looked at {looked})"
+        ),
+    }
+}
+
 fn is_absolute_ref(path: &str) -> bool {
     let b = path.as_bytes();
     if path.starts_with('/') || path.starts_with("//") {
@@ -195,5 +212,28 @@ mod tests {
         assert!(found.absolute_reference);
         assert!(found.resolved.is_none());
         assert!(!found.searched.is_empty());
+        let message = absolute_path_message(r"C:\Art\Textures\a.png", &found);
+        assert!(message.contains(r"C:\Art\Textures\a.png") || message.contains("C:/Art"));
+        assert!(message.contains("not found"));
+    }
+
+    #[test]
+    fn absolute_path_falls_back_to_the_file_name_near_the_model() {
+        let dir = std::env::temp_dir().join(format!("modelview-abs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("Textures")).unwrap();
+        fs::write(dir.join("model.fbx"), b"x").unwrap();
+        fs::write(dir.join("Textures").join("a.png"), b"png").unwrap();
+        let found = resolve(&dir.join("model.fbx"), r"C:\Users\other\Art\Textures\a.png");
+        assert!(found.absolute_reference);
+        let resolved = found
+            .resolved
+            .clone()
+            .expect("nearby file name should resolve");
+        assert_eq!(fs::read(&resolved).unwrap(), b"png");
+        let message = absolute_path_message(r"C:\Users\other\Art\Textures\a.png", &found);
+        assert!(message.contains("using"));
+        assert!(found.searched.iter().any(|s| s.contains("a.png")));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

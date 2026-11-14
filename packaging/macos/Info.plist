@@ -22,5 +22,11 @@
   <string>11.0</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>modelview opens the 3D file you picked from the Desktop.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>modelview opens the 3D file you picked from Documents.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>modelview opens the 3D file you picked from Downloads.</string>
 </dict>
 </plist>

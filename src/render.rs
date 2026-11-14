@@ -47,6 +47,7 @@ pub struct Renderer {
     queue: wgpu::Queue,
     adapter_name: String,
     pipeline: wgpu::RenderPipeline,
+    pipeline_cull: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     line_overlay: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -264,6 +265,18 @@ impl Renderer {
             &shader,
             vertex_layout.clone(),
             wgpu::PrimitiveTopology::TriangleList,
+            None,
+            wgpu::DepthBiasState::default(),
+            Some(true),
+            Some(wgpu::CompareFunction::Less),
+        );
+        let pipeline_cull = make_pipeline(
+            &device,
+            &pipeline_layout,
+            &shader,
+            vertex_layout.clone(),
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::Face::Back),
             wgpu::DepthBiasState::default(),
             Some(true),
             Some(wgpu::CompareFunction::Less),
@@ -274,6 +287,7 @@ impl Renderer {
             &shader,
             vertex_layout.clone(),
             wgpu::PrimitiveTopology::LineList,
+            None,
             wgpu::DepthBiasState::default(),
             Some(true),
             Some(wgpu::CompareFunction::Less),
@@ -284,6 +298,7 @@ impl Renderer {
             &shader,
             vertex_layout,
             wgpu::PrimitiveTopology::LineList,
+            None,
             wgpu::DepthBiasState::default(),
             Some(false),
             Some(wgpu::CompareFunction::Always),
@@ -334,6 +349,7 @@ impl Renderer {
             queue,
             adapter_name,
             pipeline,
+            pipeline_cull,
             line_pipeline,
             line_overlay,
             layout,
@@ -407,6 +423,7 @@ impl Renderer {
                 lines: draw.lines,
                 overlay: draw.overlay,
                 texture: draw.texture,
+                cull: draw.cull,
             });
         }
         if uniforms.is_empty() {
@@ -515,7 +532,11 @@ impl Renderer {
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             for (draw, bind) in draws.iter().zip(binds.iter()) {
                 let pipeline = if !draw.lines {
-                    &self.pipeline
+                    if draw.cull {
+                        &self.pipeline_cull
+                    } else {
+                        &self.pipeline
+                    }
                 } else if draw.overlay {
                     &self.line_overlay
                 } else {
@@ -643,6 +664,7 @@ struct Draw {
     lines: bool,
     overlay: bool,
     texture: Option<usize>,
+    cull: bool,
 }
 
 struct CpuDraw {
@@ -651,6 +673,7 @@ struct CpuDraw {
     lines: bool,
     overlay: bool,
     texture: Option<usize>,
+    cull: bool,
     model: Mat4,
     normal_mat: Mat4,
     base_color: [f32; 4],
@@ -724,12 +747,15 @@ fn prepare(frame: &FrameRequest<'_>) -> Prepared {
                 });
             }
             let count = vertices.len() as u32 - start;
+            let opaque = material.map(|m| m.base_color[3] >= 0.99).unwrap_or(true);
+            let cull = opaque && !material.map(|m| m.double_sided).unwrap_or(false);
             if count >= 3 {
                 draws.push(CpuDraw {
                     vertex_start: start,
                     vertex_count: count,
                     lines: false,
                     overlay: false,
+                    cull,
                     texture: if frame.mode == RenderMode::Shaded {
                         texture
                     } else {
@@ -760,6 +786,7 @@ fn prepare(frame: &FrameRequest<'_>) -> Prepared {
                         vertex_count: line_count,
                         lines: true,
                         overlay: true,
+                        cull: false,
                         texture: None,
                         model,
                         normal_mat: Mat4::IDENTITY,
@@ -789,6 +816,7 @@ fn prepare(frame: &FrameRequest<'_>) -> Prepared {
                 vertex_count: line_count,
                 lines: true,
                 overlay: true,
+                cull: false,
                 texture: None,
                 model: Mat4::IDENTITY,
                 normal_mat: Mat4::IDENTITY,
@@ -852,6 +880,7 @@ fn push_grid(vertices: &mut Vec<GpuVertex>, draws: &mut Vec<CpuDraw>, bounds: Aa
             vertex_count: count,
             lines: true,
             overlay: false,
+            cull: false,
             texture: None,
             model: Mat4::IDENTITY,
             normal_mat: Mat4::IDENTITY,
@@ -966,6 +995,7 @@ fn camera_matrix(
 ) -> Mat4 {
     let target = Vec3::from(bounds.center()) + Vec3::from(target_offset);
     let distance = (frame_distance(bounds) * distance_scale.max(0.05)).max(0.05);
+    let (near, far) = clip_planes(bounds, distance_scale);
     let yaw = yaw_deg.to_radians();
     let pitch = pitch_deg.clamp(-89.0, 89.0).to_radians();
     let eye = target
@@ -977,12 +1007,19 @@ fn camera_matrix(
     let view = glam::camera::rh::view::look_at_mat4(eye, target, Vec3::Y);
     let aspect = width as f32 / height.max(1) as f32;
     // WebGPU's clip space is Y-up and Z in [0, 1], which is glam's DirectX convention.
-    glam::camera::rh::proj::directx::perspective(
-        40f32.to_radians(),
-        aspect,
-        (distance / 100.0).max(0.001),
-        distance * 100.0,
-    ) * view
+    glam::camera::rh::proj::directx::perspective(40f32.to_radians(), aspect, near, far) * view
+}
+
+/// Near and far planes fitted to the framed bounds. A fixed 10_000:1 range
+/// turns a 2cm mesh (or a large one with a very small near plane) into
+/// depth-buffer noise.
+pub fn clip_planes(bounds: Aabb, distance_scale: f32) -> (f32, f32) {
+    let radius = bounds.radius().max(1e-4);
+    let distance = (frame_distance(bounds) * distance_scale.max(0.05)).max(radius * 1.05);
+    let closest = (distance - radius).max(radius * 1e-3);
+    let near = (closest * 0.25).max(radius * 1e-4);
+    let far = distance + radius * 2.5;
+    (near, far.max(near * 4.0))
 }
 
 fn pack_uniform(view_proj: Mat4, draw: &CpuDraw) -> Uniforms {
@@ -1001,6 +1038,7 @@ fn make_pipeline(
     shader: &wgpu::ShaderModule,
     vertex_layout: wgpu::VertexBufferLayout<'_>,
     topology: wgpu::PrimitiveTopology,
+    cull_mode: Option<wgpu::Face>,
     bias: wgpu::DepthBiasState,
     depth_write: Option<bool>,
     depth_compare: Option<wgpu::CompareFunction>,
@@ -1017,7 +1055,7 @@ fn make_pipeline(
         },
         primitive: wgpu::PrimitiveState {
             topology,
-            cull_mode: None,
+            cull_mode,
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -1060,4 +1098,31 @@ pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
 pub fn joint_slot(scene: &Scene, mesh: &Mesh, bone_node: usize) -> Option<usize> {
     let skin = mesh.skin.and_then(|i| scene.skins.get(i))?;
     skin.joints.iter().position(|j| *j == bone_node)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_planes_fit_tiny_and_large_bounds() {
+        for half in [0.01f32, 1.5, 40.0] {
+            let bounds = Aabb {
+                min: [-half, -half, -half],
+                max: [half, half, half],
+            };
+            let (near, far) = clip_planes(bounds, 1.0);
+            let distance = frame_distance(bounds);
+            let radius = bounds.radius();
+            assert!(
+                near < distance - radius,
+                "near {near} clips radius {radius}"
+            );
+            assert!(far > distance + radius, "far {far} clips the back");
+            assert!(
+                far / near < 40.0,
+                "depth range {far}/{near} is too wide for half={half}"
+            );
+        }
+    }
 }

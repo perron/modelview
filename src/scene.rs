@@ -565,6 +565,15 @@ impl Aabb {
         let ext = Vec3::from(self.max) - Vec3::from(self.min);
         (ext.length() * 0.5).max(1e-4)
     }
+
+    /// Longest edge of the box. Zero when the box is empty.
+    pub fn max_extent(self) -> f32 {
+        if !self.is_valid() {
+            return 0.0;
+        }
+        let ext = Vec3::from(self.max) - Vec3::from(self.min);
+        ext.x.abs().max(ext.y.abs()).max(ext.z.abs())
+    }
 }
 
 pub fn push_checked(tris: &mut usize) -> crate::Result<()> {

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use glam::{Mat4, Vec4};
+use glam::{Mat4, Vec3, Vec4};
 
 use crate::error::Result;
 use crate::load::textures::{self, decode_bytes};
@@ -100,8 +100,70 @@ pub fn load(path: &Path) -> Result<Scene> {
         }
     }
 
+    // Centimeter (and millimeter) files get their unit scale baked into node
+    // matrices. Some exporters also store that same scale in the bind matrix,
+    // so skinning applies it twice and the mesh collapses next to a full-size
+    // skeleton. Drop the extra scale from the bind when it matches the file unit.
+    undo_duplicate_unit_scale(&mut scene);
     note_file(&mut scene, &loaded);
     Ok(scene)
+}
+
+/// Inverse-bind scale that repeats `original_unit_meters` on top of the
+/// unit scale already baked into the bone world matrices.
+fn undo_duplicate_unit_scale(scene: &mut Scene) {
+    let Some(unit) = scene.source.original_unit_meters else {
+        return;
+    };
+    if !(unit > 1e-5 && unit < 0.5) {
+        return;
+    }
+    let worlds = scene.world_matrices(None, 0.0);
+    let mut bone_scales = Vec::new();
+    for (i, node) in scene.nodes.iter().enumerate() {
+        if node.is_bone {
+            if let Some(scale) = uniform_scale(worlds[i]) {
+                bone_scales.push(scale);
+            }
+        }
+    }
+    if bone_scales.is_empty() || !bone_scales.iter().any(|s| scales_match(*s, unit)) {
+        return;
+    }
+    let factor = 1.0 / unit;
+    let widen = Mat4::from_scale(Vec3::splat(factor));
+    for skin in &mut scene.skins {
+        let bind_scales: Vec<f32> = skin
+            .inverse_bind
+            .iter()
+            .filter_map(|m| uniform_scale(Mat4::from_cols_array(m)))
+            .collect();
+        if bind_scales.is_empty() || !bind_scales.iter().all(|s| scales_match(*s, unit)) {
+            continue;
+        }
+        for matrix in &mut skin.inverse_bind {
+            let fixed = widen * Mat4::from_cols_array(matrix);
+            *matrix = fixed.to_cols_array();
+        }
+    }
+}
+
+fn uniform_scale(matrix: Mat4) -> Option<f32> {
+    let (scale, _, _) = matrix.to_scale_rotation_translation();
+    if !scale.is_finite() {
+        return None;
+    }
+    let max = scale.x.abs().max(scale.y.abs()).max(scale.z.abs());
+    let min = scale.x.abs().min(scale.y.abs()).min(scale.z.abs());
+    if max < 1e-8 || (max - min) / max > 0.2 {
+        return None;
+    }
+    Some(max)
+}
+
+fn scales_match(scale: f32, unit: f32) -> bool {
+    let ratio = scale / unit;
+    (0.5..=2.0).contains(&ratio)
 }
 
 fn note_file(scene: &mut Scene, loaded: &ufbx::Scene) {
@@ -547,7 +609,7 @@ fn push_texture(scene: &mut Scene, model: &Path, tex: &ufbx::Texture) -> usize {
         if found.absolute_reference {
             scene.add_problem(Problem::warning(
                 "TEXTURE_ABSOLUTE_PATH",
-                format!("texture '{referenced}' uses an absolute path"),
+                textures::absolute_path_message(&referenced, &found),
             ));
         }
         if let Some(path) = found.resolved {
@@ -755,6 +817,155 @@ mod tests {
                 scene.bounds.radius()
             );
         }
+    }
+
+    fn cm_skinned_fbx(ibm_scale: f64, geo_scale: f64) -> String {
+        // 180cm column, hips at the origin, head 170cm up. UnitScaleFactor 100.
+        // Inverse bind on the hips is a uniform scale (`ibm_scale`). Identity is the
+        // honest bind; 0.01 imitates an exporter that already baked centimeters.
+        let s = ibm_scale;
+        format!(
+            r#"; FBX 7.7.0 project file
+FBXHeaderExtension:  {{
+	FBXHeaderVersion: 1004
+	FBXVersion: 7700
+	Creator: "modelview synthetic"
+}}
+GlobalSettings:  {{
+	Version: 1000
+	Properties70:  {{
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+		P: "FrontAxis", "int", "Integer", "",2
+		P: "FrontAxisSign", "int", "Integer", "",1
+		P: "CoordAxis", "int", "Integer", "",0
+		P: "CoordAxisSign", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",1
+		P: "OriginalUnitScaleFactor", "double", "Number", "",1
+	}}
+}}
+Objects:  {{
+	Geometry: 10, "Geometry::Body", "Mesh" {{
+		Vertices: *12 {{
+			a: -10,0,0, 10,0,0, 10,180,0, -10,180,0
+		}}
+		PolygonVertexIndex: *6 {{
+			a: 0,1,2,-4
+		}}
+		GeometryVersion: 124
+	}}
+	Model: 20, "Model::Hips", "LimbNode" {{
+		Version: 232
+		Properties70:  {{
+			P: "Lcl Translation", "Lcl Translation", "", "A",0,0,0
+			P: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,0
+			P: "Lcl Scaling", "Lcl Scaling", "", "A",1,1,1
+		}}
+	}}
+	Model: 21, "Model::Head", "LimbNode" {{
+		Version: 232
+		Properties70:  {{
+			P: "Lcl Translation", "Lcl Translation", "", "A",0,170,0
+			P: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,0
+			P: "Lcl Scaling", "Lcl Scaling", "", "A",1,1,1
+		}}
+	}}
+	Model: 22, "Model::Body", "Mesh" {{
+		Version: 232
+		Properties70:  {{
+			P: "Lcl Translation", "Lcl Translation", "", "A",0,0,0
+			P: "Lcl Rotation", "Lcl Rotation", "", "A",0,0,0
+			P: "Lcl Scaling", "Lcl Scaling", "", "A",1,1,1
+			P: "GeometricScaling", "Vector3D", "Vector", "",{geo_scale},{geo_scale},{geo_scale}
+		}}
+	}}
+	Deformer: 30, "Deformer::Skin", "Skin" {{
+		Version: 101
+		Link_DeformAcuracy: 50
+		SkinningType: "Linear"
+	}}
+	Deformer: 31, "SubDeformer::HipsCluster", "Cluster" {{
+		Version: 100
+		Indexes: *4 {{
+			a: 0,1,2,3
+		}}
+		Weights: *4 {{
+			a: 1,1,1,1
+		}}
+		Transform: *16 {{
+			a: {s},0,0,0, 0,{s},0,0, 0,0,{s},0, 0,0,0,1
+		}}
+		TransformLink: *16 {{
+			a: 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
+		}}
+	}}
+}}
+Connections:  {{
+	C: "OO",20,0
+	C: "OO",21,20
+	C: "OO",22,0
+	C: "OO",10,22
+	C: "OO",30,10
+	C: "OO",31,30
+	C: "OO",20,31
+}}
+"#
+        )
+    }
+
+    fn load_cm(ibm_scale: f64) -> Scene {
+        let dir = std::env::temp_dir().join(format!(
+            "mv-skin-{}-{}",
+            ibm_scale.to_bits(),
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("char.fbx");
+        fs::write(&path, cm_skinned_fbx(ibm_scale, 1.0)).unwrap();
+        let mut scene = load(&path).unwrap();
+        scene.recompute_bounds();
+        crate::validate::add_geometry_problems(&mut scene);
+        let _ = fs::remove_dir_all(&dir);
+        scene
+    }
+
+    #[test]
+    fn centimeter_bind_scale_is_not_applied_twice() {
+        // Honest bind: vertices are centimeters, bone matrices carry the 0.01.
+        let plain = load_cm(1.0);
+        let head = plain
+            .world_matrices(None, 0.0)
+            .get(plain.nodes.iter().position(|n| n.name == "Head").unwrap())
+            .copied()
+            .unwrap();
+        assert!(
+            (head.w_axis.y - 1.7).abs() < 0.05,
+            "skeleton head {}",
+            head.w_axis.y
+        );
+        assert!(
+            (plain.bounds.max[1] - 1.8).abs() < 0.05,
+            "plain mesh height {}",
+            plain.bounds.max[1]
+        );
+
+        // Exporter also wrote 0.01 into geometry_to_bone. The mesh must stay
+        // the same height as the skeleton, not collapse to 1.8cm.
+        let doubled = load_cm(0.01);
+        assert!(
+            (doubled.bounds.max[1] - 1.8).abs() < 0.15,
+            "doubled unit scale mesh height {}",
+            doubled.bounds.max[1]
+        );
+        assert!(
+            doubled
+                .problems
+                .iter()
+                .all(|p| p.code != "MESH_SKELETON_MISMATCH"),
+            "corrected mesh should agree with the skeleton: {:?}",
+            doubled.problems
+        );
     }
 
     #[test]

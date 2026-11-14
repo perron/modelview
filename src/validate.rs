@@ -98,6 +98,102 @@ pub fn add_geometry_problems(scene: &mut Scene) {
     for problem in extra {
         scene.add_problem(problem);
     }
+    flag_mesh_skeleton_mismatch(scene);
+}
+
+/// A skinned mesh that is tens of times smaller or larger than the skeleton
+/// is the centimeter-bind failure: the bones are full size and the mesh is a
+/// blob at the root. Accessories that are merely smaller than the body stay
+/// under the ratio.
+fn flag_mesh_skeleton_mismatch(scene: &mut Scene) {
+    let worlds = scene.world_matrices(None, 0.0);
+    let mut skeleton = crate::scene::Aabb::empty();
+    for (i, node) in scene.nodes.iter().enumerate() {
+        if node.is_bone {
+            skeleton.include(worlds[i].w_axis.truncate().to_array());
+        }
+    }
+    let skeleton_extent = skeleton.max_extent();
+    if skeleton_extent < 1e-3 {
+        return;
+    }
+    let skinned: Vec<usize> = scene
+        .meshes
+        .iter()
+        .enumerate()
+        .filter(|(_, mesh)| mesh.skin.is_some() && !mesh.joints.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    let mut mesh_box = crate::scene::Aabb::empty();
+    for mi in skinned {
+        let (positions, _) = scene.posed_mesh(mi, &worlds);
+        for p in positions {
+            mesh_box.include(p);
+        }
+    }
+    let mesh_extent = mesh_box.max_extent();
+    if mesh_extent < 1e-8 {
+        return;
+    }
+    let ratio = skeleton_extent / mesh_extent;
+    if ratio >= 20.0 || mesh_extent / skeleton_extent >= 20.0 {
+        scene.add_problem(Problem::warning(
+            "MESH_SKELETON_MISMATCH",
+            format!(
+                "skinned mesh is {mesh_extent:.4} m across and the skeleton is {skeleton_extent:.4} m across ({ratio:.0}x). The bind matrix and the bone transforms are not in the same scale"
+            ),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::{Mesh, Node, Skin, Trs};
+
+    #[test]
+    fn flags_a_mesh_that_is_tiny_next_to_its_skeleton() {
+        let mut scene = Scene::new("fbx");
+        scene.nodes.push(Node {
+            name: "hips".into(),
+            parent: None,
+            children: vec![1],
+            rest: Trs::identity(),
+            meshes: vec![0],
+            is_bone: true,
+        });
+        let mut head = Trs::identity();
+        head.translation = [0.0, 1.7, 0.0];
+        scene.nodes.push(Node {
+            name: "head".into(),
+            parent: Some(0),
+            children: vec![],
+            rest: head,
+            meshes: vec![],
+            is_bone: true,
+        });
+        let mut mesh = Mesh::new("body");
+        mesh.positions = vec![[0.0, 0.0, 0.0], [0.0, 0.018, 0.0], [0.01, 0.0, 0.0]];
+        mesh.indices = vec![0, 1, 2];
+        mesh.joints = vec![[0, 0, 0, 0]; 3];
+        mesh.weights = vec![[1.0, 0.0, 0.0, 0.0]; 3];
+        mesh.skin = Some(0);
+        scene.meshes.push(mesh);
+        scene.skins.push(Skin {
+            name: "skin".into(),
+            joints: vec![0],
+            inverse_bind: vec![glam::Mat4::IDENTITY.to_cols_array()],
+        });
+        add_geometry_problems(&mut scene);
+        assert!(
+            scene
+                .problems
+                .iter()
+                .any(|p| p.code == "MESH_SKELETON_MISMATCH"),
+            "{:?}",
+            scene.problems
+        );
+    }
 }
 
 pub fn counts(scene: &Scene) -> (usize, usize, usize) {
