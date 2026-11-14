@@ -134,7 +134,9 @@ JSON schemas for the stable fields are in `docs/schemas/`. Every object has
 Codes you can branch on: `FILE_NOT_FOUND`, `PARSE_FAILED`, `TIMEOUT`,
 `UNSUPPORTED_EXTENSION`, `TEXTURE_MISSING`, `TEXTURE_ABSOLUTE_PATH`, `TEXTURE_DECODE_FAILED`,
 `DEGENERATE_GEOMETRY`, `UNSUPPORTED_FEATURE`, `PERMISSION_DENIED`,
-`INVALID_ARGUMENT`, `IO_ERROR`, `RENDER_FAILED`, `EXPORT_FAILED`.
+`INVALID_ARGUMENT`, `IO_ERROR`, `RENDER_FAILED`, `RENDER_EMPTY`, `EXPORT_FAILED`.
+`RENDER_EMPTY` means the picture is a solid colour, so `render` exits non-zero
+instead of writing `ok: true`.
 `validate` also reports `UNITS_CM`, `UNITS_MM`, `UNITS_NOTE`, `AXIS_NOTE`,
 `ASCII_FBX`, `OLD_FBX_VERSION`, `MISSING_UV`, `MAX_INFLUENCES_GT_4`,
 `NEGATIVE_SCALE`, `EMPTY_MESH`, and similar notes. Infos do not fail

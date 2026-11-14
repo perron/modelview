@@ -19,6 +19,8 @@ struct Uniforms {
     base_color: vec4<f32>,
     // x metallic, y roughness, z mode, w has_texture
     misc: vec4<f32>,
+    // x alpha mode (0 opaque, 1 mask, 2 blend), y cutoff, z unlit
+    extra: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -40,7 +42,11 @@ fn vs_main(v: Vertex) -> VsOut {
 @fragment
 fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     let mode = u32(u.misc.z + 0.5);
-    let n = normalize(i.normal);
+    var raw_n = i.normal;
+    if (dot(raw_n, raw_n) < 1e-6) {
+        raw_n = vec3<f32>(0.0, 1.0, 0.0);
+    }
+    let n = normalize(raw_n);
     if (mode == 2u) {
         return vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
     }
@@ -56,17 +62,40 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     if (mode == 5u) {
         return vec4<f32>(i.color.rgb, 1.0);
     }
+    var nrm = n;
+    if (dot(nrm, nrm) < 1e-6) {
+        nrm = vec3<f32>(0.0, 1.0, 0.0);
+    }
+    nrm = normalize(nrm);
     var albedo = u.base_color.rgb;
+    var alpha = u.base_color.a;
     if (u.misc.w > 0.5) {
-        albedo = albedo * textureSample(tex, samp, i.uv).rgb;
+        let sample = textureSample(tex, samp, i.uv);
+        // A zero factor with a texture is how some exporters say "the texture is the color".
+        if (dot(albedo, albedo) < 1e-6) {
+            albedo = sample.rgb;
+        } else {
+            albedo = albedo * sample.rgb;
+        }
+        alpha = alpha * sample.a;
+    }
+    let alpha_mode = u32(u.extra.x + 0.5);
+    if (alpha_mode == 1u && alpha < u.extra.y) {
+        discard;
+    }
+    if (alpha_mode == 2u && alpha < 0.02) {
+        discard;
+    }
+    if (u.extra.z > 0.5) {
+        return vec4<f32>(albedo, alpha);
     }
     let key = normalize(vec3<f32>(0.35, 0.85, 0.40));
     let fill = normalize(vec3<f32>(-0.65, 0.25, -0.35));
-    let ndl = clamp(dot(n, key), 0.0, 1.0);
-    let ndf = clamp(dot(n, fill), 0.0, 1.0);
+    let ndl = clamp(dot(nrm, key), 0.0, 1.0);
+    let ndf = clamp(dot(nrm, fill), 0.0, 1.0);
     var lit = albedo * (0.20 + 0.80 * ndl) + albedo * 0.18 * ndf;
     if (mode == 1u) {
         lit = mix(lit, vec3<f32>(0.05, 0.05, 0.06), 0.72);
     }
-    return vec4<f32>(lit, 1.0);
+    return vec4<f32>(lit, alpha);
 }

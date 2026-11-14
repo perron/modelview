@@ -124,23 +124,54 @@ fn flag_mesh_skeleton_mismatch(scene: &mut Scene) {
         .filter(|(_, mesh)| mesh.skin.is_some() && !mesh.joints.is_empty())
         .map(|(i, _)| i)
         .collect();
-    let mut mesh_box = crate::scene::Aabb::empty();
+    let mut largest_posed = 0.0f32;
+    let mut largest_name = String::new();
     for mi in skinned {
+        let mesh = &scene.meshes[mi];
+        let mut raw = crate::scene::Aabb::empty();
+        for p in &mesh.positions {
+            raw.include(*p);
+        }
+        let raw_extent = raw.max_extent();
+        let mut posed_box = crate::scene::Aabb::empty();
         let (positions, _) = scene.posed_mesh(mi, &worlds);
         for p in positions {
-            mesh_box.include(p);
+            posed_box.include(p);
+        }
+        let posed = posed_box.max_extent();
+        if posed < 1e-8 {
+            continue;
+        }
+        if posed > largest_posed {
+            largest_posed = posed;
+            largest_name = mesh.name.clone();
+        }
+        // Rest-pose vertices are already in meters. Skinning should not change
+        // a mesh's size by an order of magnitude. This catches a collapsed
+        // body even when the skeleton measurement is collapsed with it.
+        let against_vertices = if raw_extent > 1e-4 {
+            raw_extent / posed
+        } else {
+            1.0
+        };
+        if against_vertices >= 8.0 || posed / raw_extent.max(1e-8) >= 8.0 {
+            scene.add_problem(Problem::warning(
+                "MESH_SKELETON_MISMATCH",
+                format!(
+                    "skinned mesh '{}' is {posed:.4} m across but its bind-pose vertices are {raw_extent:.4} m ({against_vertices:.0}x). The bind matrix and the bone transforms are not in the same scale",
+                    mesh.name
+                ),
+            ));
         }
     }
-    let mesh_extent = mesh_box.max_extent();
-    if mesh_extent < 1e-8 {
-        return;
-    }
-    let ratio = skeleton_extent / mesh_extent;
-    if ratio >= 20.0 || mesh_extent / skeleton_extent >= 20.0 {
+    // Only the largest skinned mesh is compared with the skeleton. A 14cm
+    // eye or tooth next to a 2m skeleton is not a scale bug.
+    if skeleton_extent >= 0.25 && largest_posed > 1e-8 && skeleton_extent / largest_posed >= 12.0 {
+        let ratio = skeleton_extent / largest_posed;
         scene.add_problem(Problem::warning(
             "MESH_SKELETON_MISMATCH",
             format!(
-                "skinned mesh is {mesh_extent:.4} m across and the skeleton is {skeleton_extent:.4} m across ({ratio:.0}x). The bind matrix and the bone transforms are not in the same scale"
+                "skinned mesh '{largest_name}' is {largest_posed:.4} m across and the skeleton is {skeleton_extent:.4} m ({ratio:.0}x). The bind matrix and the bone transforms are not in the same scale"
             ),
         ));
     }

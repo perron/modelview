@@ -215,14 +215,27 @@ fn convert_material(mat: &gltf::Material, images: &[Option<usize>]) -> Material 
             .copied()
             .flatten()
     });
+    let alpha_mode = match mat.alpha_mode() {
+        gltf::material::AlphaMode::Mask => "mask",
+        gltf::material::AlphaMode::Blend => "blend",
+        gltf::material::AlphaMode::Opaque => "opaque",
+    };
+    let unlit = mat.extension_value("KHR_materials_unlit").is_some();
     Material {
         name: mat.name().unwrap_or("material").to_string(),
         base_color: factor,
         metallic: pbr.metallic_factor(),
         roughness: pbr.roughness_factor(),
         base_color_texture: tex,
-        shading_model: "pbr-metallic-roughness".into(),
+        shading_model: if unlit {
+            "unlit"
+        } else {
+            "pbr-metallic-roughness"
+        }
+        .into(),
         double_sided: mat.double_sided(),
+        alpha_mode: alpha_mode.into(),
+        alpha_cutoff: mat.alpha_cutoff().unwrap_or(0.5),
     }
 }
 
@@ -973,7 +986,7 @@ mod tests {
         let json = format!(
             r#"{{
                 "asset": {{"version": "2.0"}},
-                "extensionsUsed": ["KHR_texture_transform"],
+                "extensionsUsed": ["KHR_texture_transform", "KHR_materials_unlit"],
                 "extensionsRequired": ["KHR_texture_transform"],
                 "buffers": [{{"byteLength": {len}}}],
                 "bufferViews": [
@@ -987,7 +1000,11 @@ mod tests {
                     {{"bufferView": 2, "componentType": 5123, "count": 3, "type": "SCALAR"}}
                 ],
                 "materials": [{{
+                    "alphaMode": "MASK",
+                    "alphaCutoff": 0.4,
+                    "extensions": {{"KHR_materials_unlit": {{}}}},
                     "pbrMetallicRoughness": {{
+                        "baseColorFactor": [0, 0, 0, 1],
                         "baseColorTexture": {{
                             "index": 0,
                             "extensions": {{
@@ -1016,6 +1033,10 @@ mod tests {
             (uv[0][0] - 0.25).abs() < 1e-4 && (uv[1][0] - 2.25).abs() < 1e-4,
             "transformed uvs {uv:?}"
         );
+        assert_eq!(scene.materials[0].alpha_mode, "mask");
+        assert!((scene.materials[0].alpha_cutoff - 0.4).abs() < 1e-4);
+        assert_eq!(scene.materials[0].shading_model, "unlit");
+        assert_eq!(scene.materials[0].base_color[0], 0.0);
         let _ = fs::remove_dir_all(&dir);
     }
 }

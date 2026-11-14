@@ -398,6 +398,12 @@ fn render_one(
             std::fs::create_dir_all(parent).map_err(MvError::io)?;
         }
     }
+    if render::image_is_empty(&image) {
+        return Err(MvError::new(
+            "RENDER_EMPTY",
+            "render produced a blank image. The mesh may be off camera or zero size",
+        ));
+    }
     image
         .save(output)
         .map_err(|err| MvError::render(err.to_string()))?;
@@ -435,6 +441,7 @@ fn render_turntable(
     let mut sheet = image::RgbaImage::new(columns * w, rows * h);
     let mut renderer = Renderer::new()?;
     let mut filled = false;
+    let mut saw_content = false;
     for i in 0..frames {
         let yaw = i as f32 * (360.0 / frames as f32);
         let image = renderer.render_rgba(&FrameRequest {
@@ -453,6 +460,9 @@ fn render_turntable(
             distance_scale: 1.0,
             target_offset: [0.0, 0.0, 0.0],
         })?;
+        if !render::image_is_empty(&image) {
+            saw_content = true;
+        }
         if !filled {
             let bg = *image.get_pixel(0, 0);
             for pixel in sheet.pixels_mut() {
@@ -463,6 +473,12 @@ fn render_turntable(
         let col = i % columns;
         let row = i / columns;
         image::imageops::overlay(&mut sheet, &image, (col * w) as i64, (row * h) as i64);
+    }
+    if !saw_content {
+        return Err(MvError::new(
+            "RENDER_EMPTY",
+            "turntable produced only blank frames. The mesh may be off camera or zero size",
+        ));
     }
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {

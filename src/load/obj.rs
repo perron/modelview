@@ -134,6 +134,8 @@ pub fn parse_obj(path: &Path, text: &str) -> Result<Scene> {
             // Opaque OBJ materials are single sided. Drawing both sides of a
             // shell z-fights and reads as speckled holes.
             double_sided: mtl.d < 0.99,
+            alpha_mode: if mtl.d < 0.99 { "blend" } else { "opaque" }.into(),
+            alpha_cutoff: 0.5,
         };
         if let Some(map) = &mtl.map_kd {
             material.base_color_texture = Some(push_texture(&mut scene, path, map));

@@ -129,16 +129,52 @@ fn is_absolute_ref(path: &str) -> bool {
 }
 
 pub fn decode_bytes(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    decode_bytes_named(bytes, None)
+}
+
+/// `name` is the referenced file name, used when the container has no magic
+/// (TGA). Embedded FBX images are often TGA, including RLE.
+pub fn decode_bytes_named(bytes: &[u8], name: Option<&str>) -> Option<(u32, u32, Vec<u8>)> {
     if bytes.len() >= 4 && &bytes[..4] == b"DDS " {
         return decode_dds(bytes);
     }
-    let image = image::load_from_memory(bytes).ok()?;
+    if let Some(image) = image::load_from_memory(bytes).ok() {
+        return rgba_image(image);
+    }
+    let hint_tga = name
+        .map(|n| {
+            n.rsplit('.')
+                .next()
+                .unwrap_or("")
+                .eq_ignore_ascii_case("tga")
+        })
+        .unwrap_or(false);
+    if hint_tga || looks_like_tga(bytes) {
+        if let Some(image) =
+            image::load_from_memory_with_format(bytes, image::ImageFormat::Tga).ok()
+        {
+            return rgba_image(image);
+        }
+    }
+    None
+}
+
+fn rgba_image(image: image::DynamicImage) -> Option<(u32, u32, Vec<u8>)> {
     let rgba = image.to_rgba8();
     let (w, h) = rgba.dimensions();
     if w == 0 || h == 0 || (w as u64) * (h as u64) > 8192 * 8192 {
         return None;
     }
     Some((w, h, rgba.into_raw()))
+}
+
+fn looks_like_tga(bytes: &[u8]) -> bool {
+    if bytes.len() < 18 {
+        return false;
+    }
+    let image_type = bytes[2];
+    // 2/3 uncompressed truecolor/grayscale, 10/11 RLE.
+    matches!(image_type, 2 | 3 | 10 | 11) && bytes[1] <= 1
 }
 
 fn decode_dds(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
@@ -235,5 +271,44 @@ mod tests {
         assert!(message.contains("using"));
         assert!(found.searched.iter().any(|s| s.contains("a.png")));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tga_uncompressed_red() -> Vec<u8> {
+        let mut bytes = vec![0u8; 18];
+        bytes[2] = 2;
+        bytes[12] = 1;
+        bytes[14] = 1;
+        bytes[16] = 32;
+        bytes[17] = 8;
+        bytes.extend_from_slice(&[0, 0, 255, 255]);
+        bytes
+    }
+
+    fn tga_rle_green() -> Vec<u8> {
+        let mut bytes = vec![0u8; 18];
+        bytes[2] = 10;
+        bytes[12] = 2;
+        bytes[14] = 1;
+        bytes[16] = 32;
+        bytes[17] = 8;
+        // RLE packet: 1 + 1 pixels of green.
+        bytes.push(0x80 | 1);
+        bytes.extend_from_slice(&[0, 255, 0, 255]);
+        bytes
+    }
+
+    #[test]
+    fn decodes_uncompressed_and_rle_tga() {
+        let raw = decode_bytes_named(&tga_uncompressed_red(), Some("a.tga")).unwrap();
+        assert_eq!(raw.0, 1);
+        assert_eq!(raw.1, 1);
+        assert_eq!(&raw.2[..4], &[255, 0, 0, 255]);
+        let rle = decode_bytes_named(&tga_rle_green(), Some("b.TGA")).unwrap();
+        assert_eq!((rle.0, rle.1), (2, 1));
+        assert_eq!(&rle.2[..4], &[0, 255, 0, 255]);
+        assert!(
+            decode_bytes(&tga_uncompressed_red()).is_some()
+                || looks_like_tga(&tga_uncompressed_red())
+        );
     }
 }

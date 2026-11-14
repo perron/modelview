@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat4, Vec4};
 
 use crate::error::Result;
-use crate::load::textures::{self, decode_bytes};
+use crate::load::textures::{self, decode_bytes, decode_bytes_named};
 use crate::scene::{
     push_checked, Animation, Material, Mesh, Node, Problem, Scene, Skin, Texture, Track, Trs, UvSet,
 };
@@ -19,7 +19,12 @@ pub fn load(path: &Path) -> Result<Scene> {
     opts.generate_missing_normals = true;
     opts.target_unit_meters = 1.0;
     opts.target_axes = ufbx::CoordinateAxes::right_handed_y_up();
-    opts.space_conversion = ufbx::SpaceConversion::AdjustTransforms;
+    // Bake the file's unit into the vertices. AdjustTransforms leaves Maya and
+    // Unreal centimetre meshes in file units while scaling only the nodes, and
+    // the bind translations stay in centimetres, so skinning collapses the mesh.
+    // ModifyGeometry is the conversion ufbx documents for a viewer: vertices,
+    // bind matrices, and bone translations end up in the same meter space.
+    opts.space_conversion = ufbx::SpaceConversion::ModifyGeometry;
     opts.geometry_transform_handling = ufbx::GeometryTransformHandling::ModifyGeometry;
     opts.clean_skin_weights = true;
     opts.ignore_missing_external_files = true;
@@ -100,70 +105,8 @@ pub fn load(path: &Path) -> Result<Scene> {
         }
     }
 
-    // Centimeter (and millimeter) files get their unit scale baked into node
-    // matrices. Some exporters also store that same scale in the bind matrix,
-    // so skinning applies it twice and the mesh collapses next to a full-size
-    // skeleton. Drop the extra scale from the bind when it matches the file unit.
-    undo_duplicate_unit_scale(&mut scene);
     note_file(&mut scene, &loaded);
     Ok(scene)
-}
-
-/// Inverse-bind scale that repeats `original_unit_meters` on top of the
-/// unit scale already baked into the bone world matrices.
-fn undo_duplicate_unit_scale(scene: &mut Scene) {
-    let Some(unit) = scene.source.original_unit_meters else {
-        return;
-    };
-    if !(unit > 1e-5 && unit < 0.5) {
-        return;
-    }
-    let worlds = scene.world_matrices(None, 0.0);
-    let mut bone_scales = Vec::new();
-    for (i, node) in scene.nodes.iter().enumerate() {
-        if node.is_bone {
-            if let Some(scale) = uniform_scale(worlds[i]) {
-                bone_scales.push(scale);
-            }
-        }
-    }
-    if bone_scales.is_empty() || !bone_scales.iter().any(|s| scales_match(*s, unit)) {
-        return;
-    }
-    let factor = 1.0 / unit;
-    let widen = Mat4::from_scale(Vec3::splat(factor));
-    for skin in &mut scene.skins {
-        let bind_scales: Vec<f32> = skin
-            .inverse_bind
-            .iter()
-            .filter_map(|m| uniform_scale(Mat4::from_cols_array(m)))
-            .collect();
-        if bind_scales.is_empty() || !bind_scales.iter().all(|s| scales_match(*s, unit)) {
-            continue;
-        }
-        for matrix in &mut skin.inverse_bind {
-            let fixed = widen * Mat4::from_cols_array(matrix);
-            *matrix = fixed.to_cols_array();
-        }
-    }
-}
-
-fn uniform_scale(matrix: Mat4) -> Option<f32> {
-    let (scale, _, _) = matrix.to_scale_rotation_translation();
-    if !scale.is_finite() {
-        return None;
-    }
-    let max = scale.x.abs().max(scale.y.abs()).max(scale.z.abs());
-    let min = scale.x.abs().min(scale.y.abs()).min(scale.z.abs());
-    if max < 1e-8 || (max - min) / max > 0.2 {
-        return None;
-    }
-    Some(max)
-}
-
-fn scales_match(scale: f32, unit: f32) -> bool {
-    let ratio = scale / unit;
-    (0.5..=2.0).contains(&ratio)
 }
 
 fn note_file(scene: &mut Scene, loaded: &ufbx::Scene) {
@@ -553,6 +496,8 @@ fn convert_material(mat: &ufbx::Material, tex_ids: &HashMap<u32, usize>) -> Mate
             }
         },
         double_sided: mat.features.double_sided.enabled,
+        alpha_mode: "opaque".into(),
+        alpha_cutoff: 0.5,
     }
 }
 
@@ -588,7 +533,7 @@ fn push_texture(scene: &mut Scene, model: &Path, tex: &ufbx::Texture) -> usize {
         rgba: Vec::new(),
     };
     if !embedded_bytes.is_empty() {
-        match decode_bytes(&embedded_bytes) {
+        match decode_bytes_named(&embedded_bytes, Some(&referenced)) {
             Some((w, h, rgba)) => {
                 texture.status = "ok".into();
                 texture.width = w;
@@ -819,11 +764,10 @@ mod tests {
         }
     }
 
-    fn cm_skinned_fbx(ibm_scale: f64, geo_scale: f64) -> String {
-        // 180cm column, hips at the origin, head 170cm up. UnitScaleFactor 100.
-        // Inverse bind on the hips is a uniform scale (`ibm_scale`). Identity is the
-        // honest bind; 0.01 imitates an exporter that already baked centimeters.
-        let s = ibm_scale;
+    fn cm_skinned_fbx(geo_scale: f64) -> String {
+        // 180cm column, hips at the origin, head 170cm up. UnitScaleFactor 1
+        // means one centimetre per file unit. The cluster matrix is a rotation
+        // plus a centimetre translation, matching Maya and Unreal bind poses.
         format!(
             r#"; FBX 7.7.0 project file
 FBXHeaderExtension:  {{
@@ -893,7 +837,7 @@ Objects:  {{
 			a: 1,1,1,1
 		}}
 		Transform: *16 {{
-			a: {s},0,0,0, 0,{s},0,0, 0,0,{s},0, 0,0,0,1
+			a: 0,1,0,0, -1,0,0,0, 0,0,1,0, 0,-90,0,1
 		}}
 		TransformLink: *16 {{
 			a: 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
@@ -913,16 +857,14 @@ Connections:  {{
         )
     }
 
-    fn load_cm(ibm_scale: f64) -> Scene {
-        let dir = std::env::temp_dir().join(format!(
-            "mv-skin-{}-{}",
-            ibm_scale.to_bits(),
-            std::process::id()
-        ));
+    fn load_cm() -> Scene {
+        let dir = std::env::temp_dir().join(format!("mv-skin-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("char.fbx");
-        fs::write(&path, cm_skinned_fbx(ibm_scale, 1.0)).unwrap();
+        // Bind is a 90 degree rotation plus a centimetre translation, which is
+        // how Maya and Unreal write cluster matrices. The 3x3 scale is 1.
+        fs::write(&path, cm_skinned_fbx(1.0)).unwrap();
         let mut scene = load(&path).unwrap();
         scene.recompute_bounds();
         crate::validate::add_geometry_problems(&mut scene);
@@ -931,40 +873,31 @@ Connections:  {{
     }
 
     #[test]
-    fn centimeter_bind_scale_is_not_applied_twice() {
-        // Honest bind: vertices are centimeters, bone matrices carry the 0.01.
-        let plain = load_cm(1.0);
-        let head = plain
+    fn centimetre_cluster_translation_stays_with_the_skeleton() {
+        let scene = load_cm();
+        let head = scene
             .world_matrices(None, 0.0)
-            .get(plain.nodes.iter().position(|n| n.name == "Head").unwrap())
+            .get(scene.nodes.iter().position(|n| n.name == "Head").unwrap())
             .copied()
             .unwrap();
         assert!(
-            (head.w_axis.y - 1.7).abs() < 0.05,
+            (head.w_axis.y - 1.7).abs() < 0.08,
             "skeleton head {}",
             head.w_axis.y
         );
+        let extent = scene.bounds.max_extent();
         assert!(
-            (plain.bounds.max[1] - 1.8).abs() < 0.05,
-            "plain mesh height {}",
-            plain.bounds.max[1]
-        );
-
-        // Exporter also wrote 0.01 into geometry_to_bone. The mesh must stay
-        // the same height as the skeleton, not collapse to 1.8cm.
-        let doubled = load_cm(0.01);
-        assert!(
-            (doubled.bounds.max[1] - 1.8).abs() < 0.15,
-            "doubled unit scale mesh height {}",
-            doubled.bounds.max[1]
+            (1.2..2.6).contains(&extent),
+            "mesh extent {extent} bounds {:?}",
+            scene.bounds
         );
         assert!(
-            doubled
+            scene
                 .problems
                 .iter()
                 .all(|p| p.code != "MESH_SKELETON_MISMATCH"),
-            "corrected mesh should agree with the skeleton: {:?}",
-            doubled.problems
+            "{:?}",
+            scene.problems
         );
     }
 

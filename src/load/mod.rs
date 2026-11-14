@@ -64,10 +64,9 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
     if !path.is_file() {
         return Err(MvError::file_not_found(path.display()));
     }
-    // Read the bytes in this process. On macOS a Desktop/Documents/Downloads
-    // file raises the privacy prompt for whoever calls open(); doing it here
-    // attributes the prompt to the app. The worker only sees a temp copy.
-    let file_bytes = fs::read(path).map_err(MvError::io)?;
+    // A killed parent cannot run its Drop guard, so a previous load can leave
+    // modelview-<pid>-*/model.fbx behind. Sweep those before making a new one.
+    sweep_stale_temp_dirs();
     let exe = std::env::current_exe().map_err(MvError::io)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -76,12 +75,27 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("bin");
     let dir = std::env::temp_dir().join(format!("modelview-{}-{stamp}", std::process::id()));
     fs::create_dir_all(&dir).map_err(MvError::io)?;
-    let src = dir.join(format!("model.{ext}"));
     let out = dir.join("scene.bin");
-    fs::write(&src, &file_bytes).map_err(MvError::io)?;
-    if ext.eq_ignore_ascii_case("obj") {
-        copy_obj_sidecars(path, &src);
-    }
+    // macOS privacy prompts are attributed to the process that opens a
+    // Desktop/Documents/Downloads file. Read and copy there so the prompt
+    // names this app. Other platforms hand the worker the original path.
+    let src = if cfg!(target_os = "macos") {
+        let file_bytes = fs::read(path).map_err(|err| {
+            let _ = fs::remove_dir_all(&dir);
+            MvError::io(err)
+        })?;
+        let src = dir.join(format!("model.{ext}"));
+        if let Err(err) = fs::write(&src, &file_bytes) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(MvError::io(err));
+        }
+        if ext.eq_ignore_ascii_case("obj") {
+            copy_obj_sidecars(path, &src);
+        }
+        src
+    } else {
+        path.to_path_buf()
+    };
     let mut cmd = Command::new(exe);
     cmd.arg("--load-worker")
         .arg(&src)
@@ -122,6 +136,38 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
         refresh_external_textures(&mut scene, path);
     }
     Ok(scene)
+}
+
+/// Delete `modelview-*` temp dirs and files left by a parent that was killed
+/// mid-load. Anything touched in the last 10 minutes is left alone.
+fn sweep_stale_temp_dirs() {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(10 * 60))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("modelview-") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified >= cutoff {
+            continue;
+        }
+        if meta.is_dir() {
+            let _ = fs::remove_dir_all(entry.path());
+        } else {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// OBJ materials and textures are read in this process, next to the original
@@ -192,7 +238,9 @@ fn refresh_external_textures(scene: &mut Scene, original: &Path) {
         .retain(|p| p.code != "TEXTURE_MISSING" && p.code != "TEXTURE_ABSOLUTE_PATH");
     let mut notes = Vec::new();
     for index in 0..scene.textures.len() {
-        if scene.textures[index].embedded && scene.textures[index].status == "ok" {
+        // Embedded images are not files on disk. A failed decode stays
+        // TEXTURE_DECODE_FAILED and is not also reported missing.
+        if scene.textures[index].embedded {
             continue;
         }
         let referenced = scene.textures[index].referenced_path.clone();
@@ -467,5 +515,24 @@ mod tests {
             .any(|p| p.code == "TEXTURE_ABSOLUTE_PATH"));
         let deg = load_in_process(&root.join("degenerate.obj")).unwrap();
         assert!(deg.problems.iter().any(|p| p.code == "DEGENERATE_GEOMETRY"));
+    }
+
+    #[test]
+    fn stale_temp_dirs_are_removed_and_fresh_ones_stay() {
+        let root = std::env::temp_dir();
+        let stale = root.join(format!("modelview-stale-{}", std::process::id()));
+        let fresh = root.join(format!("modelview-fresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&stale);
+        let _ = fs::remove_dir_all(&fresh);
+        fs::create_dir_all(&stale).unwrap();
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(stale.join("model.fbx"), b"leftover").unwrap();
+        let file = fs::File::open(&stale).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        sweep_stale_temp_dirs();
+        assert!(!stale.exists(), "stale temp dir should be gone");
+        assert!(fresh.exists(), "a temp dir from this run should stay");
+        let _ = fs::remove_dir_all(&fresh);
     }
 }

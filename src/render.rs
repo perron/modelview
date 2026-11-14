@@ -38,6 +38,7 @@ struct Uniforms {
     normal_mat: [[f32; 4]; 4],
     base_color: [f32; 4],
     misc: [f32; 4],
+    extra: [f32; 4],
 }
 
 const UNIFORM_STRIDE: u64 = 256;
@@ -48,6 +49,7 @@ pub struct Renderer {
     adapter_name: String,
     pipeline: wgpu::RenderPipeline,
     pipeline_cull: wgpu::RenderPipeline,
+    pipeline_blend: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     line_overlay: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -269,6 +271,7 @@ impl Renderer {
             wgpu::DepthBiasState::default(),
             Some(true),
             Some(wgpu::CompareFunction::Less),
+            false,
         );
         let pipeline_cull = make_pipeline(
             &device,
@@ -280,6 +283,19 @@ impl Renderer {
             wgpu::DepthBiasState::default(),
             Some(true),
             Some(wgpu::CompareFunction::Less),
+            false,
+        );
+        let pipeline_blend = make_pipeline(
+            &device,
+            &pipeline_layout,
+            &shader,
+            vertex_layout.clone(),
+            wgpu::PrimitiveTopology::TriangleList,
+            None,
+            wgpu::DepthBiasState::default(),
+            Some(false),
+            Some(wgpu::CompareFunction::Less),
+            true,
         );
         let line_pipeline = make_pipeline(
             &device,
@@ -291,6 +307,7 @@ impl Renderer {
             wgpu::DepthBiasState::default(),
             Some(true),
             Some(wgpu::CompareFunction::Less),
+            false,
         );
         let line_overlay = make_pipeline(
             &device,
@@ -302,6 +319,7 @@ impl Renderer {
             wgpu::DepthBiasState::default(),
             Some(false),
             Some(wgpu::CompareFunction::Always),
+            false,
         );
         let white_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("white"),
@@ -350,6 +368,7 @@ impl Renderer {
             adapter_name,
             pipeline,
             pipeline_cull,
+            pipeline_blend,
             line_pipeline,
             line_overlay,
             layout,
@@ -424,6 +443,7 @@ impl Renderer {
                 overlay: draw.overlay,
                 texture: draw.texture,
                 cull: draw.cull,
+                blend: draw.blend,
             });
         }
         if uniforms.is_empty() {
@@ -433,6 +453,7 @@ impl Renderer {
                 normal_mat: Mat4::IDENTITY.to_cols_array_2d(),
                 base_color: [1.0, 1.0, 1.0, 1.0],
                 misc: [0.0, 0.5, 0.0, 0.0],
+                extra: [0.0; 4],
             });
         }
         let mut uniform_bytes = Vec::with_capacity(uniforms.len() * UNIFORM_STRIDE as usize);
@@ -532,7 +553,9 @@ impl Renderer {
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             for (draw, bind) in draws.iter().zip(binds.iter()) {
                 let pipeline = if !draw.lines {
-                    if draw.cull {
+                    if draw.blend {
+                        &self.pipeline_blend
+                    } else if draw.cull {
                         &self.pipeline_cull
                     } else {
                         &self.pipeline
@@ -665,6 +688,7 @@ struct Draw {
     overlay: bool,
     texture: Option<usize>,
     cull: bool,
+    blend: bool,
 }
 
 struct CpuDraw {
@@ -674,10 +698,12 @@ struct CpuDraw {
     overlay: bool,
     texture: Option<usize>,
     cull: bool,
+    blend: bool,
     model: Mat4,
     normal_mat: Mat4,
     base_color: [f32; 4],
     misc: [f32; 4],
+    extra: [f32; 4],
 }
 
 struct Prepared {
@@ -726,29 +752,83 @@ fn prepare(frame: &FrameRequest<'_>) -> Prepared {
                     .unwrap_or(false)
             });
             let uv_set = mesh.uvs.get(frame.uv_set).or_else(|| mesh.uvs.first());
-            for i in 0..positions.len() {
-                let uv = uv_set
-                    .and_then(|s| s.coords.get(i))
-                    .copied()
-                    .unwrap_or([0.0, 0.0]);
-                let slot = frame
-                    .bone
-                    .and_then(|node| joint_slot(frame.scene, mesh, node));
-                let color = if frame.mode == RenderMode::Weights {
-                    heat(weight_of(mesh, i, slot))
-                } else {
-                    [1.0, 1.0, 1.0, 1.0]
-                };
-                vertices.push(GpuVertex {
-                    pos: positions[i],
-                    normal: normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
-                    uv,
-                    color,
-                });
+            let corners: Vec<u32> = if mesh.indices.len() >= 3 {
+                mesh.indices.clone()
+            } else {
+                (0..positions.len() as u32).collect()
+            };
+            for tri in corners.chunks_exact(3) {
+                let mut tri = [tri[0], tri[1], tri[2]];
+                // Keep the geometric winding on the same side as the stored
+                // normals. A negative node scale or an exporter that flips
+                // only one of them makes back-face culling punch holes.
+                if let (Some(a), Some(b), Some(c)) = (
+                    positions.get(tri[0] as usize),
+                    positions.get(tri[1] as usize),
+                    positions.get(tri[2] as usize),
+                ) {
+                    let geo =
+                        (Vec3::from(*b) - Vec3::from(*a)).cross(Vec3::from(*c) - Vec3::from(*a));
+                    let stored = [tri[0], tri[1], tri[2]]
+                        .iter()
+                        .filter_map(|i| normals.get(*i as usize).copied())
+                        .map(Vec3::from)
+                        .fold(Vec3::ZERO, |acc, n| acc + n);
+                    let mirrored = model.determinant() < 0.0;
+                    if (geo.dot(stored) < 0.0) != mirrored {
+                        tri.swap(1, 2);
+                    }
+                }
+                for idx in tri {
+                    let i = idx as usize;
+                    let uv = uv_set
+                        .and_then(|s| s.coords.get(i))
+                        .copied()
+                        .unwrap_or([0.0, 0.0]);
+                    let slot = frame
+                        .bone
+                        .and_then(|node| joint_slot(frame.scene, mesh, node));
+                    let color = if frame.mode == RenderMode::Weights {
+                        heat(weight_of(mesh, i, slot))
+                    } else {
+                        [1.0, 1.0, 1.0, 1.0]
+                    };
+                    let mut normal = normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
+                    if Vec3::from(normal).length_squared() < 1e-8 {
+                        normal = [0.0, 1.0, 0.0];
+                    }
+                    vertices.push(GpuVertex {
+                        pos: positions.get(i).copied().unwrap_or([0.0, 0.0, 0.0]),
+                        normal,
+                        uv,
+                        color,
+                    });
+                }
             }
             let count = vertices.len() as u32 - start;
-            let opaque = material.map(|m| m.base_color[3] >= 0.99).unwrap_or(true);
+            let alpha_mode = material.map(|m| m.alpha_mode.as_str()).unwrap_or("opaque");
+            let blend =
+                alpha_mode == "blend" || material.map(|m| m.base_color[3] < 0.99).unwrap_or(false);
+            let opaque = !blend && alpha_mode != "mask";
             let cull = opaque && !material.map(|m| m.double_sided).unwrap_or(false);
+            let extra = [
+                match alpha_mode {
+                    "mask" => 1.0,
+                    "blend" => 2.0,
+                    _ if blend => 2.0,
+                    _ => 0.0,
+                },
+                material.map(|m| m.alpha_cutoff).unwrap_or(0.5),
+                if material
+                    .map(|m| m.shading_model.eq_ignore_ascii_case("unlit"))
+                    .unwrap_or(false)
+                {
+                    1.0
+                } else {
+                    0.0
+                },
+                0.0,
+            ];
             if count >= 3 {
                 draws.push(CpuDraw {
                     vertex_start: start,
@@ -774,6 +854,8 @@ fn prepare(frame: &FrameRequest<'_>) -> Prepared {
                             0.0
                         },
                     ],
+                    extra,
+                    blend,
                 });
             }
             if frame.mode == RenderMode::Wireframe && count >= 3 {
@@ -792,6 +874,8 @@ fn prepare(frame: &FrameRequest<'_>) -> Prepared {
                         normal_mat: Mat4::IDENTITY,
                         base_color: [0.92, 0.94, 0.96, 1.0],
                         misc: [0.0, 0.0, 5.0, 0.0],
+                        extra: [0.0; 4],
+                        blend: false,
                     });
                 }
             }
@@ -822,9 +906,12 @@ fn prepare(frame: &FrameRequest<'_>) -> Prepared {
                 normal_mat: Mat4::IDENTITY,
                 base_color: [0.95, 0.55, 0.20, 1.0],
                 misc: [0.0, 0.0, 5.0, 0.0],
+                extra: [0.0; 4],
+                blend: false,
             });
         }
     }
+    draws.sort_by_key(|d| d.blend);
     Prepared { vertices, draws }
 }
 
@@ -886,6 +973,8 @@ fn push_grid(vertices: &mut Vec<GpuVertex>, draws: &mut Vec<CpuDraw>, bounds: Aa
             normal_mat: Mat4::IDENTITY,
             base_color: [0.45, 0.48, 0.52, 1.0],
             misc: [0.0, 0.0, 5.0, 0.0],
+            extra: [0.0; 4],
+            blend: false,
         });
     }
 }
@@ -1010,6 +1099,22 @@ fn camera_matrix(
     glam::camera::rh::proj::directx::perspective(40f32.to_radians(), aspect, near, far) * view
 }
 
+/// A render that is one solid color drew neither the mesh nor the grid.
+pub fn image_is_empty(image: &RgbaImage) -> bool {
+    if image.width() == 0 || image.height() == 0 {
+        return true;
+    }
+    let mut min = [255u8; 3];
+    let mut max = [0u8; 3];
+    for pixel in image.pixels() {
+        for c in 0..3 {
+            min[c] = min[c].min(pixel[c]);
+            max[c] = max[c].max(pixel[c]);
+        }
+    }
+    max[0] - min[0] < 4 && max[1] - min[1] < 4 && max[2] - min[2] < 4
+}
+
 /// Near and far planes fitted to the framed bounds. A fixed 10_000:1 range
 /// turns a 2cm mesh (or a large one with a very small near plane) into
 /// depth-buffer noise.
@@ -1029,6 +1134,7 @@ fn pack_uniform(view_proj: Mat4, draw: &CpuDraw) -> Uniforms {
         normal_mat: draw.normal_mat.to_cols_array_2d(),
         base_color: draw.base_color,
         misc: draw.misc,
+        extra: draw.extra,
     }
 }
 
@@ -1042,6 +1148,7 @@ fn make_pipeline(
     bias: wgpu::DepthBiasState,
     depth_write: Option<bool>,
     depth_compare: Option<wgpu::CompareFunction>,
+    alpha_blend: bool,
 ) -> wgpu::RenderPipeline {
     let buffers = [Some(vertex_layout)];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1072,7 +1179,11 @@ fn make_pipeline(
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                blend: Some(wgpu::BlendState::REPLACE),
+                blend: Some(if alpha_blend {
+                    wgpu::BlendState::ALPHA_BLENDING
+                } else {
+                    wgpu::BlendState::REPLACE
+                }),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -1124,5 +1235,14 @@ mod tests {
                 "depth range {far}/{near} is too wide for half={half}"
             );
         }
+    }
+
+    #[test]
+    fn a_solid_colour_image_is_empty() {
+        let blank = RgbaImage::from_pixel(8, 8, image::Rgba([40, 42, 48, 255]));
+        assert!(image_is_empty(&blank));
+        let mut drawn = blank.clone();
+        drawn.put_pixel(3, 3, image::Rgba([220, 180, 40, 255]));
+        assert!(!image_is_empty(&drawn));
     }
 }

@@ -393,6 +393,9 @@ pub struct Material {
     pub base_color_texture: Option<usize>,
     pub shading_model: String,
     pub double_sided: bool,
+    /// "opaque", "mask", or "blend".
+    pub alpha_mode: String,
+    pub alpha_cutoff: f32,
 }
 
 impl Default for Material {
@@ -405,6 +408,8 @@ impl Default for Material {
             base_color_texture: None,
             shading_model: "default".into(),
             double_sided: true,
+            alpha_mode: "opaque".into(),
+            alpha_cutoff: 0.5,
         }
     }
 }
