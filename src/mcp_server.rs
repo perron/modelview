@@ -204,6 +204,7 @@ impl ModelServer {
                     bone: None,
                     show_skeleton: scene.bone_count() > 0,
                     show_grid: true,
+                    show_surface: true,
                     distance_scale: 1.0,
                     target_offset: [0.0, 0.0, 0.0],
                 }) {

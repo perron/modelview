@@ -568,7 +568,7 @@ impl Aabb {
             return 1.0;
         }
         let ext = Vec3::from(self.max) - Vec3::from(self.min);
-        (ext.length() * 0.5).max(1e-4)
+        (ext.length() * 0.5).max(1e-8)
     }
 
     /// Longest edge of the box. Zero when the box is empty.

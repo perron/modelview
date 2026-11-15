@@ -413,6 +413,7 @@ impl Viewer {
                     bone: self.bone,
                     show_skeleton: self.show_skeleton,
                     show_grid: true,
+                    show_surface: true,
                     distance_scale: self.zoom,
                     target_offset: self.target_offset,
                 }) {

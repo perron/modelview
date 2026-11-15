@@ -442,6 +442,42 @@ fn load_does_not_change_source_ctime_mtime_or_nlink() {
 }
 
 #[test]
+fn chunked_vertex_buffers_match_a_single_buffer() {
+    let scene = modelview::load_in_process(std::path::Path::new("testdata/generated/cube.obj"))
+        .expect("cube");
+    let mut renderer = modelview::render::Renderer::new().expect("renderer");
+    let frame = modelview::render::FrameRequest {
+        scene: &scene,
+        width: 64,
+        height: 64,
+        yaw: 35.0,
+        pitch: 25.0,
+        mode: modelview::render::RenderMode::Shaded,
+        anim: None,
+        time: 0.0,
+        uv_set: 0,
+        bone: None,
+        show_skeleton: false,
+        show_grid: true,
+        show_surface: true,
+        distance_scale: 1.0,
+        target_offset: [0.0, 0.0, 0.0],
+    };
+    let whole = renderer.render_rgba(&frame).expect("full buffer");
+    // Three triangles of the 48-byte vertex per chunk, so the cube is split.
+    renderer.set_vertex_budget(48 * 9);
+    let chunked = renderer.render_rgba(&frame).expect("chunked buffers");
+    assert_eq!(whole.dimensions(), chunked.dimensions());
+    let mut different = 0u32;
+    for (a, b) in whole.pixels().zip(chunked.pixels()) {
+        if a != b {
+            different += 1;
+        }
+    }
+    assert_eq!(different, 0, "chunked drawing changed {different} pixels");
+}
+
+#[test]
 fn a_blank_render_is_render_empty() {
     let scene = modelview::Scene::new("obj");
     let mut renderer = modelview::render::Renderer::new().expect("renderer");
@@ -459,6 +495,7 @@ fn a_blank_render_is_render_empty() {
             bone: None,
             show_skeleton: false,
             show_grid: false,
+            show_surface: true,
             distance_scale: 1.0,
             target_offset: [0.0, 0.0, 0.0],
         })

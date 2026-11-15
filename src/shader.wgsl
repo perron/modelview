@@ -27,6 +27,22 @@ struct Uniforms {
 @group(0) @binding(1) var tex: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
 
+struct CompactIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) normal: vec4<f32>,
+}
+
+@vertex
+fn vs_compact(v: CompactIn) -> VsOut {
+    var o: VsOut;
+    let world = u.model * vec4<f32>(v.pos, 1.0);
+    o.clip = u.view_proj * world;
+    o.normal = (u.normal_mat * vec4<f32>(v.normal.xyz, 0.0)).xyz;
+    o.uv = vec2<f32>(0.0, 0.0);
+    o.color = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    return o;
+}
+
 @vertex
 fn vs_main(v: Vertex) -> VsOut {
     var o: VsOut;

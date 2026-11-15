@@ -30,6 +30,16 @@ struct GpuVertex {
     color: [f32; 4],
 }
 
+/// Position plus a packed normal. Used when the full 48-byte vertex would
+/// overflow the device buffer limit. UVs and vertex colors are not needed
+/// for an untextured shaded mesh.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CompactVertex {
+    pos: [f32; 3],
+    normal: [i8; 4],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Uniforms {
@@ -52,9 +62,15 @@ pub struct Renderer {
     pipeline_blend: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     line_overlay: wgpu::RenderPipeline,
+    compact: wgpu::RenderPipeline,
+    compact_cull: wgpu::RenderPipeline,
+    compact_blend: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     white: wgpu::Texture,
+    /// Device max, and the budget uploads actually use (tests can lower it).
+    max_buffer_size: u64,
+    vertex_budget: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +99,9 @@ pub struct FrameRequest<'a> {
     pub bone: Option<usize>,
     pub show_skeleton: bool,
     pub show_grid: bool,
+    /// When false, the grid and skeleton are drawn and the meshes are not.
+    /// Used to tell a blank model from the background.
+    pub show_surface: bool,
     /// 1.0 frames the bounds. Smaller moves the camera closer.
     pub distance_scale: f32,
     pub target_offset: [f32; 3],
@@ -152,7 +171,14 @@ pub fn view_angles(view: &str) -> Result<(f32, f32)> {
 
 pub fn frame_distance(bounds: Aabb) -> f32 {
     let fov = 40f32.to_radians();
-    bounds.radius() / (fov * 0.5).tan() * 1.4
+    bounds.radius().max(1e-9) / (fov * 0.5).tan() * 1.4
+}
+
+/// Camera distance used to frame `bounds`. Scales from sub-millimetre parts
+/// up to kilometres; it is not clamped to a fixed 5 cm.
+pub fn view_distance(bounds: Aabb, distance_scale: f32) -> f32 {
+    let radius = bounds.radius().max(1e-9);
+    (frame_distance(bounds) * distance_scale.max(0.05)).max(radius * 1.05)
 }
 
 impl Renderer {
@@ -181,14 +207,14 @@ impl Renderer {
         .map_err(|err| MvError::render(format!("no GPU adapter: {err}")))?;
         let info = adapter.get_info();
         let adapter_name = format!("{:?} {} ({:?})", info.backend, info.name, info.device_type);
+        // Ask for the adapter's real limits. The defaults cap a buffer at
+        // 256 MiB, which a 20-million-vertex mesh exceeds even on a 5090.
+        let limits = adapter.limits();
+        let max_buffer_size = limits.max_buffer_size;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("modelview"),
             required_features: wgpu::Features::empty(),
-            required_limits: if software {
-                wgpu::Limits::downlevel_defaults()
-            } else {
-                wgpu::Limits::default()
-            },
+            required_limits: limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::default(),
             trace: wgpu::Trace::Off,
@@ -272,6 +298,7 @@ impl Renderer {
             Some(true),
             Some(wgpu::CompareFunction::Less),
             false,
+            "vs_main",
         );
         let pipeline_cull = make_pipeline(
             &device,
@@ -284,6 +311,7 @@ impl Renderer {
             Some(true),
             Some(wgpu::CompareFunction::Less),
             false,
+            "vs_main",
         );
         let pipeline_blend = make_pipeline(
             &device,
@@ -296,6 +324,7 @@ impl Renderer {
             Some(false),
             Some(wgpu::CompareFunction::Less),
             true,
+            "vs_main",
         );
         let line_pipeline = make_pipeline(
             &device,
@@ -308,6 +337,7 @@ impl Renderer {
             Some(true),
             Some(wgpu::CompareFunction::Less),
             false,
+            "vs_main",
         );
         let line_overlay = make_pipeline(
             &device,
@@ -320,6 +350,62 @@ impl Renderer {
             Some(false),
             Some(wgpu::CompareFunction::Always),
             false,
+            "vs_main",
+        );
+        let compact_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<CompactVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 0,
+                    shader_location: 0,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Snorm8x4,
+                    offset: 12,
+                    shader_location: 1,
+                },
+            ],
+        };
+        let compact = make_pipeline(
+            &device,
+            &pipeline_layout,
+            &shader,
+            compact_layout.clone(),
+            wgpu::PrimitiveTopology::TriangleList,
+            None,
+            wgpu::DepthBiasState::default(),
+            Some(true),
+            Some(wgpu::CompareFunction::Less),
+            false,
+            "vs_compact",
+        );
+        let compact_cull = make_pipeline(
+            &device,
+            &pipeline_layout,
+            &shader,
+            compact_layout.clone(),
+            wgpu::PrimitiveTopology::TriangleList,
+            Some(wgpu::Face::Back),
+            wgpu::DepthBiasState::default(),
+            Some(true),
+            Some(wgpu::CompareFunction::Less),
+            false,
+            "vs_compact",
+        );
+        let compact_blend = make_pipeline(
+            &device,
+            &pipeline_layout,
+            &shader,
+            compact_layout,
+            wgpu::PrimitiveTopology::TriangleList,
+            None,
+            wgpu::DepthBiasState::default(),
+            Some(false),
+            Some(wgpu::CompareFunction::Less),
+            true,
+            "vs_compact",
         );
         let white_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("white"),
@@ -371,9 +457,14 @@ impl Renderer {
             pipeline_blend,
             line_pipeline,
             line_overlay,
+            compact,
+            compact_cull,
+            compact_blend,
             layout,
             sampler,
             white: white_tex,
+            max_buffer_size,
+            vertex_budget: max_buffer_size,
         })
     }
 
@@ -444,6 +535,7 @@ impl Renderer {
                 texture: draw.texture,
                 cull: draw.cull,
                 blend: draw.blend,
+                misc: draw.misc,
             });
         }
         if uniforms.is_empty() {
@@ -473,17 +565,8 @@ impl Renderer {
         });
         self.queue.write_buffer(&uniform_buffer, 0, &uniform_bytes);
 
-        let mut vertex_bytes = bytemuck::cast_slice(&prepared.vertices).to_vec();
-        if vertex_bytes.is_empty() {
-            vertex_bytes = vec![0; std::mem::size_of::<GpuVertex>()];
-        }
-        let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("vertices"),
-            size: vertex_bytes.len() as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&vertex_buffer, 0, &vertex_bytes);
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let chunks = self.upload_vertices(&prepared.vertices, &draws)?;
 
         let mut texture_views = Vec::new();
         for texture in &frame.scene.textures {
@@ -491,35 +574,6 @@ impl Renderer {
         }
 
         let white_view = self.white_view();
-        let mut binds = Vec::with_capacity(draws.len());
-        for draw in &draws {
-            let view = draw
-                .texture
-                .and_then(|i| texture_views.get(i))
-                .unwrap_or(&white_view);
-            binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("draw"),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &uniform_buffer,
-                            offset: 0,
-                            size: NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64),
-                        }),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            }));
-        }
 
         let mut encoder = self
             .device
@@ -550,27 +604,42 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            for (draw, bind) in draws.iter().zip(binds.iter()) {
-                let pipeline = if !draw.lines {
-                    if draw.blend {
-                        &self.pipeline_blend
-                    } else if draw.cull {
-                        &self.pipeline_cull
-                    } else {
-                        &self.pipeline
-                    }
-                } else if draw.overlay {
-                    &self.line_overlay
-                } else {
-                    &self.line_pipeline
-                };
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, bind, &[draw.offset]);
-                pass.draw(
-                    draw.vertex_start..draw.vertex_start + draw.vertex_count,
-                    0..1,
-                );
+            for chunk in &chunks {
+                pass.set_vertex_buffer(0, chunk.buffer.slice(..));
+                for draw in &chunk.draws {
+                    let view = draw
+                        .texture
+                        .and_then(|i| texture_views.get(i))
+                        .unwrap_or(&white_view);
+                    let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("draw"),
+                        layout: &self.layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: &uniform_buffer,
+                                    offset: 0,
+                                    size: NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64),
+                                }),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    });
+                    pass.set_pipeline(self.pipeline_for(draw, chunk.compact));
+                    pass.set_bind_group(0, &bind, &[draw.offset]);
+                    pass.draw(
+                        draw.vertex_start..draw.vertex_start + draw.vertex_count,
+                        0..1,
+                    );
+                }
             }
         }
 
@@ -613,6 +682,12 @@ impl Renderer {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|err| MvError::render(format!("GPU poll failed: {err}")))?;
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            return Err(MvError::new(
+                "DEVICE_LIMIT",
+                format!("GPU rejected the frame: {err}"),
+            ));
+        }
         rx.recv()
             .map_err(|err| MvError::render(err.to_string()))?
             .map_err(|err| MvError::render(format!("map failed: {err}")))?;
@@ -630,6 +705,162 @@ impl Renderer {
         readback.unmap();
         RgbaImage::from_raw(width, height, pixels)
             .ok_or_else(|| MvError::render("could not pack the rendered image"))
+    }
+
+    /// Tests use this to force vertex buffers to split. The value is clamped
+    /// to the device's real `max_buffer_size`.
+    pub fn set_vertex_budget(&mut self, bytes: u64) {
+        let bytes = bytes.max(std::mem::size_of::<GpuVertex>() as u64 * 3);
+        self.vertex_budget = bytes.min(self.max_buffer_size);
+    }
+
+    fn pipeline_for(&self, draw: &Draw, compact: bool) -> &wgpu::RenderPipeline {
+        if draw.lines {
+            if draw.overlay {
+                &self.line_overlay
+            } else {
+                &self.line_pipeline
+            }
+        } else if compact {
+            if draw.blend {
+                &self.compact_blend
+            } else if draw.cull {
+                &self.compact_cull
+            } else {
+                &self.compact
+            }
+        } else if draw.blend {
+            &self.pipeline_blend
+        } else if draw.cull {
+            &self.pipeline_cull
+        } else {
+            &self.pipeline
+        }
+    }
+
+    fn upload_vertices(&self, vertices: &[GpuVertex], draws: &[Draw]) -> Result<Vec<VertexChunk>> {
+        if draws.is_empty() || vertices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let full_bytes = vertices.len() as u64 * std::mem::size_of::<GpuVertex>() as u64;
+        let compact_ok = full_bytes > self.vertex_budget && !draws_need_full_vertices(draws);
+        let mut pieces = Vec::new();
+        for draw in draws {
+            let compact = compact_ok && !draw.lines;
+            let align = if draw.lines { 2 } else { 3 };
+            let max_verts = self.max_vertices(compact)?;
+            for (start, count) in
+                split_range(draw.vertex_start, draw.vertex_count, max_verts, align)?
+            {
+                let mut piece = draw.clone();
+                piece.vertex_start = start;
+                piece.vertex_count = count;
+                pieces.push((piece, compact));
+            }
+        }
+        let mut chunks = Vec::new();
+        let mut group: Vec<(Draw, bool)> = Vec::new();
+        let mut group_verts = 0u32;
+        let mut group_compact = pieces.first().map(|p| p.1).unwrap_or(false);
+        for (piece, compact) in pieces {
+            let max_verts = self.max_vertices(compact)?;
+            let switch = compact != group_compact || group_verts + piece.vertex_count > max_verts;
+            if switch && !group.is_empty() {
+                chunks.push(self.flush_chunk(vertices, &group, group_compact)?);
+                group.clear();
+                group_verts = 0;
+            }
+            group_compact = compact;
+            group_verts += piece.vertex_count;
+            group.push((piece, compact));
+        }
+        if !group.is_empty() {
+            chunks.push(self.flush_chunk(vertices, &group, group_compact)?);
+        }
+        Ok(chunks)
+    }
+
+    fn max_vertices(&self, compact: bool) -> Result<u32> {
+        let stride = if compact {
+            std::mem::size_of::<CompactVertex>()
+        } else {
+            std::mem::size_of::<GpuVertex>()
+        } as u64;
+        let budget = self.vertex_budget.min(self.max_buffer_size);
+        let n = (budget / stride) as u32;
+        if n < 3 {
+            return Err(MvError::new(
+                "DEVICE_LIMIT",
+                format!("GPU buffer limit {budget} bytes is too small for a triangle"),
+            ));
+        }
+        Ok(n)
+    }
+
+    fn flush_chunk(
+        &self,
+        vertices: &[GpuVertex],
+        group: &[(Draw, bool)],
+        compact: bool,
+    ) -> Result<VertexChunk> {
+        let mut local_draws = Vec::with_capacity(group.len());
+        let mut local_start = 0u32;
+        let bytes = if compact {
+            let mut packed = Vec::new();
+            for (draw, _) in group {
+                let src = draw.vertex_start as usize;
+                let count = draw.vertex_count as usize;
+                for v in &vertices[src..src + count] {
+                    packed.extend_from_slice(bytemuck::bytes_of(&CompactVertex {
+                        pos: v.pos,
+                        normal: pack_normal(v.normal),
+                    }));
+                }
+                let mut local = draw.clone();
+                local.vertex_start = local_start;
+                local_draws.push(local);
+                local_start += draw.vertex_count;
+            }
+            packed
+        } else {
+            let mut packed = Vec::new();
+            for (draw, _) in group {
+                let src = draw.vertex_start as usize;
+                let count = draw.vertex_count as usize;
+                packed.extend_from_slice(bytemuck::cast_slice(&vertices[src..src + count]));
+                let mut local = draw.clone();
+                local.vertex_start = local_start;
+                local_draws.push(local);
+                local_start += draw.vertex_count;
+            }
+            packed
+        };
+        if bytes.len() as u64 > self.max_buffer_size {
+            return Err(MvError::new(
+                "DEVICE_LIMIT",
+                format!(
+                    "vertex chunk is {} bytes and the device allows {}",
+                    bytes.len(),
+                    self.max_buffer_size
+                ),
+            ));
+        }
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(if compact {
+                "vertices-compact"
+            } else {
+                "vertices"
+            }),
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buffer, 0, &bytes);
+        Ok(VertexChunk {
+            buffer,
+            compact,
+            draws: local_draws,
+        })
     }
 
     fn upload_texture(&self, texture: &crate::scene::Texture) -> wgpu::TextureView {
@@ -680,6 +911,7 @@ impl Renderer {
 // TextureView is not Clone in some wgpu versions. I used .clone() above.
 // If it fails, I'll store the white texture and recreate the view.
 
+#[derive(Clone)]
 struct Draw {
     offset: u32,
     vertex_start: u32,
@@ -689,6 +921,7 @@ struct Draw {
     texture: Option<usize>,
     cull: bool,
     blend: bool,
+    misc: [f32; 4],
 }
 
 struct CpuDraw {
@@ -711,6 +944,57 @@ struct Prepared {
     draws: Vec<CpuDraw>,
 }
 
+struct VertexChunk {
+    buffer: wgpu::Buffer,
+    compact: bool,
+    draws: Vec<Draw>,
+}
+
+fn pack_normal(normal: [f32; 3]) -> [i8; 4] {
+    let pack = |c: f32| (c.clamp(-1.0, 1.0) * 127.0).round() as i8;
+    [pack(normal[0]), pack(normal[1]), pack(normal[2]), 0]
+}
+
+fn draws_need_full_vertices(draws: &[Draw]) -> bool {
+    draws.iter().any(|draw| {
+        if draw.lines {
+            return false;
+        }
+        let mode = draw.misc[2];
+        // UV checker and weight colors need the full vertex. Textures need UVs.
+        draw.misc[3] > 0.5 || (mode > 2.5 && mode < 4.5)
+    })
+}
+
+fn split_range(start: u32, count: u32, max_verts: u32, align: u32) -> Result<Vec<(u32, u32)>> {
+    let max_verts = (max_verts / align) * align;
+    if max_verts == 0 {
+        return Err(MvError::new(
+            "DEVICE_LIMIT",
+            "GPU buffer limit is too small to hold one primitive",
+        ));
+    }
+    let mut out = Vec::new();
+    let mut left = count;
+    let mut at = start;
+    while left > 0 {
+        let mut n = left.min(max_verts);
+        if n < left {
+            n = (n / align) * align;
+        }
+        if n == 0 {
+            return Err(MvError::new(
+                "DEVICE_LIMIT",
+                "GPU buffer limit is too small to hold one primitive",
+            ));
+        }
+        out.push((at, n));
+        at += n;
+        left -= n;
+    }
+    Ok(out)
+}
+
 fn prepare(frame: &FrameRequest<'_>) -> Prepared {
     let worlds = frame.scene.world_matrices(frame.anim, frame.time);
     let mut vertices = Vec::new();
@@ -721,162 +1005,164 @@ fn prepare(frame: &FrameRequest<'_>) -> Prepared {
         push_grid(&mut vertices, &mut draws, frame.scene.bounds);
     }
 
-    for (ni, node) in frame.scene.nodes.iter().enumerate() {
-        for &mi in &node.meshes {
-            let mesh = &frame.scene.meshes[mi];
-            let skinned = mesh.skin.is_some() && !mesh.joints.is_empty();
-            if skinned && !skinned_done.insert(mi) {
-                continue;
-            }
-            let (positions, normals) = if skinned {
-                frame.scene.posed_mesh(mi, &worlds)
-            } else {
-                (mesh.positions.clone(), mesh.normals.clone())
-            };
-            let model = if skinned {
-                Mat4::IDENTITY
-            } else {
-                worlds.get(ni).copied().unwrap_or(Mat4::IDENTITY)
-            };
-            let start = vertices.len() as u32;
-            let material = mesh.material.and_then(|i| frame.scene.materials.get(i));
-            let base_color = material
-                .map(|m| m.base_color)
-                .unwrap_or([0.72, 0.74, 0.78, 1.0]);
-            let texture = material.and_then(|m| m.base_color_texture).filter(|&i| {
-                frame
-                    .scene
-                    .textures
-                    .get(i)
-                    .map(|t| t.status == "ok")
-                    .unwrap_or(false)
-            });
-            let uv_set = mesh.uvs.get(frame.uv_set).or_else(|| mesh.uvs.first());
-            let corners: Vec<u32> = if mesh.indices.len() >= 3 {
-                mesh.indices.clone()
-            } else {
-                (0..positions.len() as u32).collect()
-            };
-            for tri in corners.chunks_exact(3) {
-                let mut tri = [tri[0], tri[1], tri[2]];
-                // Keep the geometric winding on the same side as the stored
-                // normals. A negative node scale or an exporter that flips
-                // only one of them makes back-face culling punch holes.
-                if let (Some(a), Some(b), Some(c)) = (
-                    positions.get(tri[0] as usize),
-                    positions.get(tri[1] as usize),
-                    positions.get(tri[2] as usize),
-                ) {
-                    let geo =
-                        (Vec3::from(*b) - Vec3::from(*a)).cross(Vec3::from(*c) - Vec3::from(*a));
-                    let stored = [tri[0], tri[1], tri[2]]
-                        .iter()
-                        .filter_map(|i| normals.get(*i as usize).copied())
-                        .map(Vec3::from)
-                        .fold(Vec3::ZERO, |acc, n| acc + n);
-                    let mirrored = model.determinant() < 0.0;
-                    if (geo.dot(stored) < 0.0) != mirrored {
-                        tri.swap(1, 2);
-                    }
+    if frame.show_surface {
+        for (ni, node) in frame.scene.nodes.iter().enumerate() {
+            for &mi in &node.meshes {
+                let mesh = &frame.scene.meshes[mi];
+                let skinned = mesh.skin.is_some() && !mesh.joints.is_empty();
+                if skinned && !skinned_done.insert(mi) {
+                    continue;
                 }
-                for idx in tri {
-                    let i = idx as usize;
-                    let uv = uv_set
-                        .and_then(|s| s.coords.get(i))
-                        .copied()
-                        .unwrap_or([0.0, 0.0]);
-                    let slot = frame
-                        .bone
-                        .and_then(|node| joint_slot(frame.scene, mesh, node));
-                    let color = if frame.mode == RenderMode::Weights {
-                        heat(weight_of(mesh, i, slot))
-                    } else {
-                        [1.0, 1.0, 1.0, 1.0]
-                    };
-                    let mut normal = normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
-                    if Vec3::from(normal).length_squared() < 1e-8 {
-                        normal = [0.0, 1.0, 0.0];
-                    }
-                    vertices.push(GpuVertex {
-                        pos: positions.get(i).copied().unwrap_or([0.0, 0.0, 0.0]),
-                        normal,
-                        uv,
-                        color,
-                    });
-                }
-            }
-            let count = vertices.len() as u32 - start;
-            let alpha_mode = material.map(|m| m.alpha_mode.as_str()).unwrap_or("opaque");
-            let blend =
-                alpha_mode == "blend" || material.map(|m| m.base_color[3] < 0.99).unwrap_or(false);
-            let opaque = !blend && alpha_mode != "mask";
-            let cull = opaque && !material.map(|m| m.double_sided).unwrap_or(false);
-            let extra = [
-                match alpha_mode {
-                    "mask" => 1.0,
-                    "blend" => 2.0,
-                    _ if blend => 2.0,
-                    _ => 0.0,
-                },
-                material.map(|m| m.alpha_cutoff).unwrap_or(0.5),
-                if material
-                    .map(|m| m.shading_model.eq_ignore_ascii_case("unlit"))
-                    .unwrap_or(false)
-                {
-                    1.0
+                let (positions, normals) = if skinned {
+                    frame.scene.posed_mesh(mi, &worlds)
                 } else {
-                    0.0
-                },
-                0.0,
-            ];
-            if count >= 3 {
-                draws.push(CpuDraw {
-                    vertex_start: start,
-                    vertex_count: count,
-                    lines: false,
-                    overlay: false,
-                    cull,
-                    texture: if frame.mode == RenderMode::Shaded {
-                        texture
-                    } else {
-                        None
-                    },
-                    model,
-                    normal_mat: normal_matrix(model),
-                    base_color,
-                    misc: [
-                        material.map(|m| m.metallic).unwrap_or(0.0),
-                        material.map(|m| m.roughness).unwrap_or(0.55),
-                        frame.mode.shader_mode(),
-                        if texture.is_some() && frame.mode == RenderMode::Shaded {
-                            1.0
-                        } else {
-                            0.0
-                        },
-                    ],
-                    extra,
-                    blend,
+                    (mesh.positions.clone(), mesh.normals.clone())
+                };
+                let model = if skinned {
+                    Mat4::IDENTITY
+                } else {
+                    worlds.get(ni).copied().unwrap_or(Mat4::IDENTITY)
+                };
+                let start = vertices.len() as u32;
+                let material = mesh.material.and_then(|i| frame.scene.materials.get(i));
+                let base_color = material
+                    .map(|m| m.base_color)
+                    .unwrap_or([0.72, 0.74, 0.78, 1.0]);
+                let texture = material.and_then(|m| m.base_color_texture).filter(|&i| {
+                    frame
+                        .scene
+                        .textures
+                        .get(i)
+                        .map(|t| t.status == "ok")
+                        .unwrap_or(false)
                 });
-            }
-            if frame.mode == RenderMode::Wireframe && count >= 3 {
-                let line_start = vertices.len() as u32;
-                push_edges(&mut vertices, &positions, &mesh.indices);
-                let line_count = vertices.len() as u32 - line_start;
-                if line_count >= 2 {
+                let uv_set = mesh.uvs.get(frame.uv_set).or_else(|| mesh.uvs.first());
+                let corners: Vec<u32> = if mesh.indices.len() >= 3 {
+                    mesh.indices.clone()
+                } else {
+                    (0..positions.len() as u32).collect()
+                };
+                for tri in corners.chunks_exact(3) {
+                    let mut tri = [tri[0], tri[1], tri[2]];
+                    // Keep the geometric winding on the same side as the stored
+                    // normals. A negative node scale or an exporter that flips
+                    // only one of them makes back-face culling punch holes.
+                    if let (Some(a), Some(b), Some(c)) = (
+                        positions.get(tri[0] as usize),
+                        positions.get(tri[1] as usize),
+                        positions.get(tri[2] as usize),
+                    ) {
+                        let geo = (Vec3::from(*b) - Vec3::from(*a))
+                            .cross(Vec3::from(*c) - Vec3::from(*a));
+                        let stored = [tri[0], tri[1], tri[2]]
+                            .iter()
+                            .filter_map(|i| normals.get(*i as usize).copied())
+                            .map(Vec3::from)
+                            .fold(Vec3::ZERO, |acc, n| acc + n);
+                        let mirrored = model.determinant() < 0.0;
+                        if (geo.dot(stored) < 0.0) != mirrored {
+                            tri.swap(1, 2);
+                        }
+                    }
+                    for idx in tri {
+                        let i = idx as usize;
+                        let uv = uv_set
+                            .and_then(|s| s.coords.get(i))
+                            .copied()
+                            .unwrap_or([0.0, 0.0]);
+                        let slot = frame
+                            .bone
+                            .and_then(|node| joint_slot(frame.scene, mesh, node));
+                        let color = if frame.mode == RenderMode::Weights {
+                            heat(weight_of(mesh, i, slot))
+                        } else {
+                            [1.0, 1.0, 1.0, 1.0]
+                        };
+                        let mut normal = normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]);
+                        if Vec3::from(normal).length_squared() < 1e-8 {
+                            normal = [0.0, 1.0, 0.0];
+                        }
+                        vertices.push(GpuVertex {
+                            pos: positions.get(i).copied().unwrap_or([0.0, 0.0, 0.0]),
+                            normal,
+                            uv,
+                            color,
+                        });
+                    }
+                }
+                let count = vertices.len() as u32 - start;
+                let alpha_mode = material.map(|m| m.alpha_mode.as_str()).unwrap_or("opaque");
+                let blend = alpha_mode == "blend"
+                    || material.map(|m| m.base_color[3] < 0.99).unwrap_or(false);
+                let opaque = !blend && alpha_mode != "mask";
+                let cull = opaque && !material.map(|m| m.double_sided).unwrap_or(false);
+                let extra = [
+                    match alpha_mode {
+                        "mask" => 1.0,
+                        "blend" => 2.0,
+                        _ if blend => 2.0,
+                        _ => 0.0,
+                    },
+                    material.map(|m| m.alpha_cutoff).unwrap_or(0.5),
+                    if material
+                        .map(|m| m.shading_model.eq_ignore_ascii_case("unlit"))
+                        .unwrap_or(false)
+                    {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                ];
+                if count >= 3 {
                     draws.push(CpuDraw {
-                        vertex_start: line_start,
-                        vertex_count: line_count,
-                        lines: true,
-                        overlay: true,
-                        cull: false,
-                        texture: None,
+                        vertex_start: start,
+                        vertex_count: count,
+                        lines: false,
+                        overlay: false,
+                        cull,
+                        texture: if frame.mode == RenderMode::Shaded {
+                            texture
+                        } else {
+                            None
+                        },
                         model,
-                        normal_mat: Mat4::IDENTITY,
-                        base_color: [0.92, 0.94, 0.96, 1.0],
-                        misc: [0.0, 0.0, 5.0, 0.0],
-                        extra: [0.0; 4],
-                        blend: false,
+                        normal_mat: normal_matrix(model),
+                        base_color,
+                        misc: [
+                            material.map(|m| m.metallic).unwrap_or(0.0),
+                            material.map(|m| m.roughness).unwrap_or(0.55),
+                            frame.mode.shader_mode(),
+                            if texture.is_some() && frame.mode == RenderMode::Shaded {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                        ],
+                        extra,
+                        blend,
                     });
+                }
+                if frame.mode == RenderMode::Wireframe && count >= 3 {
+                    let line_start = vertices.len() as u32;
+                    push_edges(&mut vertices, &positions, &mesh.indices);
+                    let line_count = vertices.len() as u32 - line_start;
+                    if line_count >= 2 {
+                        draws.push(CpuDraw {
+                            vertex_start: line_start,
+                            vertex_count: line_count,
+                            lines: true,
+                            overlay: true,
+                            cull: false,
+                            texture: None,
+                            model,
+                            normal_mat: Mat4::IDENTITY,
+                            base_color: [0.92, 0.94, 0.96, 1.0],
+                            misc: [0.0, 0.0, 5.0, 0.0],
+                            extra: [0.0; 4],
+                            blend: false,
+                        });
+                    }
                 }
             }
         }
@@ -919,11 +1205,13 @@ fn push_grid(vertices: &mut Vec<GpuVertex>, draws: &mut Vec<CpuDraw>, bounds: Aa
     let start = vertices.len() as u32;
     let center = Vec3::from(bounds.center());
     let y = if bounds.is_valid() {
-        bounds.min[1]
+        bounds.min[1] - bounds.radius().max(1e-9) * 0.02
     } else {
         0.0
     };
-    let extent = bounds.radius().max(0.5) * 2.0;
+    // The grid is sized to the model. A 1 m floor around a 2 mm part
+    // becomes a stripe across the frame and hides the mesh.
+    let extent = bounds.radius().max(1e-9) * 2.5;
     let step = nice_step(extent / 4.0);
     let n = ((extent / step).ceil() as i32).clamp(1, 24);
     for i in -n..=n {
@@ -941,7 +1229,7 @@ fn push_grid(vertices: &mut Vec<GpuVertex>, draws: &mut Vec<CpuDraw>, bounds: Aa
             [0.30, 0.32, 0.36, 1.0],
         );
     }
-    let axis = bounds.radius().max(0.25) * 0.35;
+    let axis = bounds.radius().max(1e-9) * 0.35;
     push_line(
         vertices,
         Vec3::ZERO,
@@ -1057,7 +1345,7 @@ fn normal_matrix(model: Mat4) -> Mat4 {
 }
 
 fn nice_step(value: f32) -> f32 {
-    let value = value.max(1e-4);
+    let value = value.max(1e-12);
     let exp = value.log10().floor();
     let base = 10f32.powf(exp);
     let m = value / base;
@@ -1083,7 +1371,7 @@ fn camera_matrix(
     target_offset: [f32; 3],
 ) -> Mat4 {
     let target = Vec3::from(bounds.center()) + Vec3::from(target_offset);
-    let distance = (frame_distance(bounds) * distance_scale.max(0.05)).max(0.05);
+    let distance = view_distance(bounds, distance_scale);
     let (near, far) = clip_planes(bounds, distance_scale);
     let yaw = yaw_deg.to_radians();
     let pitch = pitch_deg.clamp(-89.0, 89.0).to_radians();
@@ -1097,6 +1385,50 @@ fn camera_matrix(
     let aspect = width as f32 / height.max(1) as f32;
     // WebGPU's clip space is Y-up and Z in [0, 1], which is glam's DirectX convention.
     glam::camera::rh::proj::directx::perspective(40f32.to_radians(), aspect, near, far) * view
+}
+
+/// How many pixels differ from a render of the same frame with the meshes hidden.
+/// A speck on the clear colour, or the grid by itself, does not count.
+pub fn model_pixel_count(image: &RgbaImage, background: &RgbaImage) -> u32 {
+    if image.dimensions() != background.dimensions() {
+        return 0;
+    }
+    image
+        .pixels()
+        .zip(background.pixels())
+        .filter(|(a, b)| {
+            let d = (a[0] as i16 - b[0] as i16).unsigned_abs() as u32
+                + (a[1] as i16 - b[1] as i16).unsigned_abs() as u32
+                + (a[2] as i16 - b[2] as i16).unsigned_abs() as u32;
+            d > 18
+        })
+        .count() as u32
+}
+
+pub fn render_misses_the_model(image: &RgbaImage, background: &RgbaImage) -> bool {
+    let different = model_pixel_count(image, background);
+    let min_pixels = (image.width().saturating_mul(image.height()) / 400).max(24);
+    different < min_pixels
+}
+
+pub fn without_surface<'a>(frame: &FrameRequest<'a>) -> FrameRequest<'a> {
+    FrameRequest {
+        scene: frame.scene,
+        width: frame.width,
+        height: frame.height,
+        yaw: frame.yaw,
+        pitch: frame.pitch,
+        mode: frame.mode,
+        anim: frame.anim,
+        time: frame.time,
+        uv_set: frame.uv_set,
+        bone: frame.bone,
+        show_skeleton: frame.show_skeleton,
+        show_grid: frame.show_grid,
+        show_surface: false,
+        distance_scale: frame.distance_scale,
+        target_offset: frame.target_offset,
+    }
 }
 
 /// A render that is one solid color drew neither the mesh nor the grid.
@@ -1119,8 +1451,8 @@ pub fn image_is_empty(image: &RgbaImage) -> bool {
 /// turns a 2cm mesh (or a large one with a very small near plane) into
 /// depth-buffer noise.
 pub fn clip_planes(bounds: Aabb, distance_scale: f32) -> (f32, f32) {
-    let radius = bounds.radius().max(1e-4);
-    let distance = (frame_distance(bounds) * distance_scale.max(0.05)).max(radius * 1.05);
+    let radius = bounds.radius().max(1e-9);
+    let distance = view_distance(bounds, distance_scale);
     let closest = (distance - radius).max(radius * 1e-3);
     let near = (closest * 0.25).max(radius * 1e-4);
     let far = distance + radius * 2.5;
@@ -1149,6 +1481,7 @@ fn make_pipeline(
     depth_write: Option<bool>,
     depth_compare: Option<wgpu::CompareFunction>,
     alpha_blend: bool,
+    vertex_entry: &'static str,
 ) -> wgpu::RenderPipeline {
     let buffers = [Some(vertex_layout)];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1156,7 +1489,7 @@ fn make_pipeline(
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
+            entry_point: Some(vertex_entry),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &buffers,
         },
@@ -1217,7 +1550,7 @@ mod tests {
 
     #[test]
     fn clip_planes_fit_tiny_and_large_bounds() {
-        for half in [0.01f32, 1.5, 40.0] {
+        for half in [1e-6f32, 0.0012, 0.01, 1.5, 40.0, 1_000.0] {
             let bounds = Aabb {
                 min: [-half, -half, -half],
                 max: [half, half, half],
@@ -1244,5 +1577,55 @@ mod tests {
         let mut drawn = blank.clone();
         drawn.put_pixel(3, 3, image::Rgba([220, 180, 40, 255]));
         assert!(!image_is_empty(&drawn));
+    }
+
+    #[test]
+    fn camera_distance_scales_from_millimetres_to_kilometres() {
+        let tiny = Aabb {
+            min: [-0.0012, -0.0012, -0.0012],
+            max: [0.0012, 0.0012, 0.0012],
+        };
+        let distance = view_distance(tiny, 1.0);
+        assert!(
+            distance < 0.02,
+            "a 2.4 mm part was framed from {distance} m"
+        );
+        assert!(distance > tiny.radius());
+        let huge = Aabb {
+            min: [-1_000.0, -1_000.0, -1_000.0],
+            max: [1_000.0, 1_000.0, 1_000.0],
+        };
+        let far = view_distance(huge, 1.0);
+        assert!(far > 1_000.0 && far < 20_000.0, "km framing was {far}");
+        let (near, plane_far) = clip_planes(tiny, 1.0);
+        assert!(plane_far / near < 40.0, "{plane_far}/{near}");
+    }
+
+    #[test]
+    fn grid_step_stays_smaller_than_a_tiny_model() {
+        let bounds = Aabb {
+            min: [0.0, 0.0, 0.0],
+            max: [0.0024, 0.0024, 0.0024],
+        };
+        let step = nice_step(bounds.radius() * 2.5 / 4.0);
+        assert!(
+            step < 0.0024,
+            "grid step {step} is larger than a 2.4 mm model"
+        );
+    }
+
+    #[test]
+    fn a_blank_frame_matches_its_background() {
+        let color = image::Rgba([40, 43, 51, 255]);
+        let image = RgbaImage::from_pixel(64, 64, color);
+        let background = image.clone();
+        assert!(render_misses_the_model(&image, &background));
+        let mut drawn = image.clone();
+        for y in 20..44 {
+            for x in 20..44 {
+                drawn.put_pixel(x, y, image::Rgba([180, 170, 160, 255]));
+            }
+        }
+        assert!(!render_misses_the_model(&drawn, &background));
     }
 }

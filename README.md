@@ -134,19 +134,21 @@ JSON schemas for the stable fields are in `docs/schemas/`. Every object has
 Codes you can branch on: `FILE_NOT_FOUND`, `PARSE_FAILED`, `TIMEOUT`,
 `UNSUPPORTED_EXTENSION`, `TEXTURE_MISSING`, `TEXTURE_ABSOLUTE_PATH`, `TEXTURE_DECODE_FAILED`,
 `DEGENERATE_GEOMETRY`, `UNSUPPORTED_FEATURE`, `PERMISSION_DENIED`,
-`INVALID_ARGUMENT`, `IO_ERROR`, `RENDER_FAILED`, `RENDER_EMPTY`, `EXPORT_FAILED`.
-`RENDER_EMPTY` means the picture is a solid colour, so `render` exits non-zero
-instead of writing `ok: true`.
+`INVALID_ARGUMENT`, `IO_ERROR`, `RENDER_FAILED`, `RENDER_EMPTY`, `DEVICE_LIMIT`, `EXPORT_FAILED`.
+`RENDER_EMPTY` means the picture matches a render with the meshes hidden, so
+`render` exits non-zero instead of writing `ok: true`. `DEVICE_LIMIT` means
+the GPU rejected a buffer; large meshes are split into chunks under the
+adapter's real buffer limit, and untextured meshes use a packed normal.
 A binary STL is accepted when its length is exactly `84 + 50 × n` triangles,
 including meshes with millions of triangles. A count that does not match
 the length is rejected. Repeated corners are stored once.
 
 Opening a model only reads it. modelview does not hard-link, clone, or write
 extended attributes, so the source file's ctime, mtime, link count, and xattrs
-stay put. The first APFS `clonefile` of a file updates that file's ctime, which
-is why the macOS temp copy is a new file written from a read-only open. An
-xattr such as `com.apple.lastuseddate` or `com.apple.provenance` is added by
-macOS itself, not by this program.
+stay put. Reading an iCloud-evicted (dataless) file downloads it, and macOS
+updates that file's ctime when the download finishes. That happens for any
+reader, not only modelview. An xattr such as `com.apple.lastuseddate` or
+`com.apple.provenance` is added by macOS itself.
 
 `validate` also reports `UNITS_CM`, `UNITS_MM`, `UNITS_NOTE`, `UNUSUAL_SCALE`, `AXIS_NOTE`,
 `ASCII_FBX`, `OLD_FBX_VERSION`, `MISSING_UV`, `MAX_INFLUENCES_GT_4`,

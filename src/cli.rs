@@ -390,15 +390,33 @@ fn render_one(
         bone: bone_node,
         show_skeleton: scene.bone_count() > 0,
         show_grid: true,
+        show_surface: true,
         distance_scale: 1.0,
         target_offset: [0.0, 0.0, 0.0],
     })?;
+    let background = renderer.render_rgba(&render::without_surface(&FrameRequest {
+        scene,
+        width: w,
+        height: h,
+        yaw: yaw.unwrap_or(view_yaw),
+        pitch: pitch.unwrap_or(view_pitch),
+        mode,
+        anim: anim_index,
+        time,
+        uv_set: uv,
+        bone: bone_node,
+        show_skeleton: scene.bone_count() > 0,
+        show_grid: true,
+        show_surface: true,
+        distance_scale: 1.0,
+        target_offset: [0.0, 0.0, 0.0],
+    }))?;
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(MvError::io)?;
         }
     }
-    if render::image_is_empty(&image) {
+    if render::render_misses_the_model(&image, &background) {
         return Err(MvError::new(
             "RENDER_EMPTY",
             "render produced a blank image. The mesh may be off camera or zero size",
@@ -457,10 +475,28 @@ fn render_turntable(
             bone: None,
             show_skeleton: scene.bone_count() > 0,
             show_grid: true,
+            show_surface: true,
             distance_scale: 1.0,
             target_offset: [0.0, 0.0, 0.0],
         })?;
-        if !render::image_is_empty(&image) {
+        let background = renderer.render_rgba(&render::without_surface(&FrameRequest {
+            scene,
+            width: w,
+            height: h,
+            yaw,
+            pitch: 20.0,
+            mode,
+            anim: anim_index,
+            time,
+            uv_set: 0,
+            bone: None,
+            show_skeleton: scene.bone_count() > 0,
+            show_grid: true,
+            show_surface: true,
+            distance_scale: 1.0,
+            target_offset: [0.0, 0.0, 0.0],
+        }))?;
+        if !render::render_misses_the_model(&image, &background) {
             saw_content = true;
         }
         if !filled {
@@ -557,9 +593,37 @@ pub fn render_png_bytes(
         },
         show_skeleton: scene.bone_count() > 0,
         show_grid: true,
+        show_surface: true,
         distance_scale: 1.0,
         target_offset: [0.0, 0.0, 0.0],
     })?;
+    let background = renderer.render_rgba(&render::without_surface(&FrameRequest {
+        scene,
+        width,
+        height,
+        yaw: yaw.unwrap_or(view_yaw),
+        pitch: pitch.unwrap_or(view_pitch),
+        mode,
+        anim: anim_index,
+        time,
+        uv_set: 0,
+        bone: if mode == RenderMode::Weights {
+            scene.nodes.iter().position(|n| n.is_bone)
+        } else {
+            None
+        },
+        show_skeleton: scene.bone_count() > 0,
+        show_grid: true,
+        show_surface: true,
+        distance_scale: 1.0,
+        target_offset: [0.0, 0.0, 0.0],
+    }))?;
+    if render::render_misses_the_model(&image, &background) {
+        return Err(MvError::new(
+            "RENDER_EMPTY",
+            "render produced a blank image. The mesh may be off camera or zero size",
+        ));
+    }
     let png = render::encode_png(&image)?;
     let meta = serde_json::json!({
         "schema": "modelview/render/v1",
