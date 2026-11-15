@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -8,31 +9,27 @@ use crate::MvError;
 pub fn load(path: &Path) -> Result<Scene> {
     let bytes = fs::read(path).map_err(MvError::io)?;
     let mut scene = Scene::new("stl");
-    let triangles = if looks_ascii(&bytes) {
-        match parse_ascii(&bytes) {
-            Ok(tris) if !tris.is_empty() => tris,
-            Ok(_) | Err(_) if binary_size_matches(&bytes) => parse_binary(&bytes)?,
-            Ok(tris) => tris,
-            Err(err) => return Err(err),
-        }
-    } else {
-        parse_binary(&bytes)?
-    };
-
     let mut mesh = Mesh::new(
         path.file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "stl".into()),
     );
-    let mut count = 0usize;
-    for (normal, verts) in triangles {
-        push_checked(&mut count)?;
-        let base = mesh.positions.len() as u32;
-        for v in verts {
-            mesh.positions.push(v);
-            mesh.normals.push(normal);
+    if looks_ascii(&bytes) && !binary_size_matches(&bytes) {
+        let triangles = parse_ascii(&bytes)?;
+        let mut count = 0usize;
+        for (normal, verts) in triangles {
+            push_checked(&mut count)?;
+            let base = mesh.positions.len() as u32;
+            for v in verts {
+                mesh.positions.push(v);
+                mesh.normals.push(normal);
+            }
+            mesh.indices.extend([base, base + 1, base + 2]);
         }
-        mesh.indices.extend([base, base + 1, base + 2]);
+    } else {
+        // Binary records are streamed straight into the mesh. A vertex that
+        // repeats with the same face normal is stored once.
+        fill_binary(&mut mesh, &bytes)?;
     }
     scene.nodes.push(Node {
         name: mesh.name.clone(),
@@ -105,34 +102,54 @@ fn parse3(text: &str) -> Option<[f32; 3]> {
     Some([x, y, z])
 }
 
-fn parse_binary(bytes: &[u8]) -> Result<Vec<([f32; 3], [[f32; 3]; 3])>> {
+/// A binary STL is `84 + 50 * n` bytes. Any `n` that makes that identity
+/// true is accepted. A count that does not match the length is corrupt,
+/// and is rejected before any triangle storage is allocated.
+fn fill_binary(mesh: &mut Mesh, bytes: &[u8]) -> Result<()> {
     if bytes.len() < 84 {
         return Err(MvError::parse(
             "binary STL is shorter than the 84-byte header",
         ));
     }
     let count = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
-    if count > crate::scene::MAX_TRIANGLES {
+    let expected = count.checked_mul(50).and_then(|n| n.checked_add(84));
+    if expected != Some(bytes.len()) {
         return Err(MvError::parse(format!(
-            "binary STL declares {count} triangles"
+            "binary STL declares {count} triangles but the file is {} bytes, not 84 + 50 * {count}",
+            bytes.len()
         )));
     }
-    let need = 84usize.saturating_add(count.saturating_mul(50));
-    if bytes.len() < need {
-        return Err(MvError::parse(format!(
-            "binary STL declares {count} triangles but the file is too short"
-        )));
-    }
-    let mut out = Vec::with_capacity(count);
+    mesh.indices.reserve(count.saturating_mul(3));
+    let mut weld: HashMap<[u32; 6], u32> = HashMap::new();
     for i in 0..count {
         let o = 84 + i * 50;
         let normal = read_f32_3(bytes, o);
-        let a = read_f32_3(bytes, o + 12);
-        let b = read_f32_3(bytes, o + 24);
-        let c = read_f32_3(bytes, o + 36);
-        out.push((normal, [a, b, c]));
+        for v in [
+            read_f32_3(bytes, o + 12),
+            read_f32_3(bytes, o + 24),
+            read_f32_3(bytes, o + 36),
+        ] {
+            let key = [
+                v[0].to_bits(),
+                v[1].to_bits(),
+                v[2].to_bits(),
+                normal[0].to_bits(),
+                normal[1].to_bits(),
+                normal[2].to_bits(),
+            ];
+            let idx = if let Some(&idx) = weld.get(&key) {
+                idx
+            } else {
+                let idx = mesh.positions.len() as u32;
+                mesh.positions.push(v);
+                mesh.normals.push(normal);
+                weld.insert(key, idx);
+                idx
+            };
+            mesh.indices.push(idx);
+        }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn read_f32_3(bytes: &[u8], offset: usize) -> [f32; 3] {
@@ -155,5 +172,55 @@ mod tests {
         assert_eq!(ascii.triangle_count(), 12);
         assert_eq!(binary.triangle_count(), 12);
         assert!(ascii.problems.iter().any(|p| p.code == "UNITS_UNKNOWN"));
+    }
+
+    #[test]
+    fn binary_stl_larger_than_the_old_cap_loads_without_duplicating_vertices() {
+        use std::io::Write;
+        // Just past the old 5_000_000 limit. Every record is the same
+        // triangle, so a correct weld keeps three vertices, not 15 million.
+        let count: u32 = 5_000_001;
+        let dir = std::env::temp_dir().join(format!("mv-stl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.stl");
+        let mut file = std::io::BufWriter::new(fs::File::create(&path).unwrap());
+        file.write_all(&[0u8; 80]).unwrap();
+        file.write_all(&count.to_le_bytes()).unwrap();
+        let mut rec = [0u8; 50];
+        rec[8..12].copy_from_slice(&1f32.to_le_bytes());
+        rec[24..28].copy_from_slice(&1f32.to_le_bytes());
+        rec[40..44].copy_from_slice(&1f32.to_le_bytes());
+        let chunk = rec.repeat(1000);
+        let full = (count as usize) / 1000;
+        let rem = (count as usize) % 1000;
+        for _ in 0..full {
+            file.write_all(&chunk).unwrap();
+        }
+        file.write_all(&rec[..rem * 50]).unwrap();
+        file.flush().unwrap();
+        drop(file);
+        let len = fs::metadata(&path).unwrap().len() as usize;
+        assert_eq!(len, 84 + 50 * count as usize);
+        let scene = load(&path).unwrap();
+        assert_eq!(scene.triangle_count(), count as usize);
+        assert_eq!(
+            scene.vertex_count(),
+            3,
+            "repeated STL corners should be stored once"
+        );
+
+        let short = dir.join("short.stl");
+        let mut bad = vec![0u8; 84 + 50];
+        bad[80..84].copy_from_slice(&2u32.to_le_bytes());
+        fs::write(&short, &bad).unwrap();
+        let err = load(&short).unwrap_err();
+        assert_eq!(err.code, "PARSE_FAILED");
+        assert!(
+            err.message.contains("declares 2 triangles"),
+            "{}",
+            err.message
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

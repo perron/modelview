@@ -137,6 +137,17 @@ Codes you can branch on: `FILE_NOT_FOUND`, `PARSE_FAILED`, `TIMEOUT`,
 `INVALID_ARGUMENT`, `IO_ERROR`, `RENDER_FAILED`, `RENDER_EMPTY`, `EXPORT_FAILED`.
 `RENDER_EMPTY` means the picture is a solid colour, so `render` exits non-zero
 instead of writing `ok: true`.
+A binary STL is accepted when its length is exactly `84 + 50 × n` triangles,
+including meshes with millions of triangles. A count that does not match
+the length is rejected. Repeated corners are stored once.
+
+Opening a model only reads it. modelview does not hard-link, clone, or write
+extended attributes, so the source file's ctime, mtime, link count, and xattrs
+stay put. The first APFS `clonefile` of a file updates that file's ctime, which
+is why the macOS temp copy is a new file written from a read-only open. An
+xattr such as `com.apple.lastuseddate` or `com.apple.provenance` is added by
+macOS itself, not by this program.
+
 `validate` also reports `UNITS_CM`, `UNITS_MM`, `UNITS_NOTE`, `UNUSUAL_SCALE`, `AXIS_NOTE`,
 `ASCII_FBX`, `OLD_FBX_VERSION`, `MISSING_UV`, `MAX_INFLUENCES_GT_4`,
 `NEGATIVE_SCALE`, `EMPTY_MESH`, and similar notes. Infos do not fail

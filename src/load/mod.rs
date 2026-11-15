@@ -114,10 +114,10 @@ pub fn load_isolated(path: &Path, timeout: Duration, memory_mb: u64) -> Result<S
     pause_for_stage_test(&dir);
     let out = dir.join("scene.bin");
     // macOS privacy prompts are attributed to the process that opens a
-    // Desktop/Documents/Downloads file, so this process opens it. A hard link
-    // would change the source file's ctime, which backup tools treat as a
-    // modification, so the source inode is never linked. Other platforms hand
-    // the worker the original path and only read it.
+    // Desktop/Documents/Downloads file, so this process opens it read-only
+    // and writes a new temp file. clonefile and hard links are not used:
+    // the first APFS clone updates the source ctime, and a hard link does
+    // too. Other platforms hand the worker the original path and only read it.
     let src = if cfg!(target_os = "macos") {
         let src = dir.join(format!("model.{ext}"));
         if let Err(err) = stage_model(path, &src) {
@@ -287,37 +287,22 @@ fn file_error(err: std::io::Error, path: &Path) -> MvError {
     }
 }
 
-/// Put a private copy of `original` at `dest` without changing the source
-/// file's ctime, mtime, or link count.
+/// Copy `original` to `dest` by reading it and writing a new file.
 ///
-/// On APFS, `clonefile` shares the extents and leaves the source inode alone.
-/// A hard link is never used: it increments `nlink` and updates ctime. If
-/// cloning is unavailable, the bytes are read and written to a new file.
+/// `clonefile` on APFS updates the source inode's ctime the first time a
+/// file is cloned, and a hard link updates ctime on every link. Neither is
+/// used. `File::open` is read-only, and nothing here writes an xattr.
 fn stage_model(original: &Path, dest: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        if clone_file(original, dest).is_ok() {
-            return Ok(());
-        }
-        let _ = fs::remove_file(dest);
-    }
-    let bytes = fs::read(original)?;
+    let bytes = read_only(original)?;
     fs::write(dest, &bytes)
 }
 
-#[cfg(target_os = "macos")]
-fn clone_file(original: &Path, dest: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let src = std::ffi::CString::new(original.as_os_str().as_bytes())
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-    let dst = std::ffi::CString::new(dest.as_os_str().as_bytes())
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-    let rc = unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+fn read_only(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = fs::OpenOptions::new().read(true).write(false).open(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn pause_for_stage_test(dir: &Path) {
@@ -417,7 +402,11 @@ fn copy_obj_sidecars(original: &Path, temp_obj: &Path) {
         if let Some(parent) = to.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::copy(&from, &to);
+        // A plain read and write. `fs::copy` on macOS clones the file and
+        // can change the source ctime.
+        if let Ok(bytes) = read_only(&from) {
+            let _ = fs::write(&to, bytes);
+        }
     }
 }
 
@@ -660,6 +649,178 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Extended attributes as `(name, value)`, sorted by name.
+///
+/// Empty on Windows and on filesystems that do not support xattrs. A load
+/// must not add, remove, or rewrite these. On macOS, `com.apple.lastuseddate`
+/// and `com.apple.provenance` are written by the system (Spotlight / provenance),
+/// not by modelview; modelview only opens the file read-only.
+pub fn source_xattrs(path: &Path) -> Vec<(String, Vec<u8>)> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        return unix_xattrs(path);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = path;
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unix_xattrs(path: &Path) -> Vec<(String, Vec<u8>)> {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return Vec::new();
+    };
+    let size = unsafe { libc::listxattr(cpath.as_ptr(), std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; size as usize];
+    let n = unsafe {
+        libc::listxattr(
+            cpath.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+        )
+    };
+    if n <= 0 {
+        return Vec::new();
+    }
+    buf.truncate(n as usize);
+    xattr_values(&cpath, &buf)
+}
+
+#[cfg(target_os = "macos")]
+fn unix_xattrs(path: &Path) -> Vec<(String, Vec<u8>)> {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return Vec::new();
+    };
+    let size = unsafe { libc::listxattr(cpath.as_ptr(), std::ptr::null_mut(), 0, 0) };
+    if size <= 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; size as usize];
+    let n = unsafe {
+        libc::listxattr(
+            cpath.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            0,
+        )
+    };
+    if n <= 0 {
+        return Vec::new();
+    }
+    buf.truncate(n as usize);
+    xattr_values(&cpath, &buf)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn xattr_values(cpath: &std::ffi::CStr, listed: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    for name in listed.split(|b| *b == 0) {
+        if name.is_empty() {
+            continue;
+        }
+        let Ok(name_c) = std::ffi::CString::new(name) else {
+            continue;
+        };
+        let Some(name_s) = name_c.to_str().ok().map(str::to_string) else {
+            continue;
+        };
+        let value = read_xattr(cpath, &name_c);
+        out.push((name_s, value));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn read_xattr(cpath: &std::ffi::CStr, name: &std::ffi::CStr) -> Vec<u8> {
+    let size = unsafe { libc::getxattr(cpath.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; size as usize];
+    let n = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return Vec::new();
+    }
+    buf.truncate(n as usize);
+    buf
+}
+
+#[cfg(target_os = "macos")]
+fn read_xattr(cpath: &std::ffi::CStr, name: &std::ffi::CStr) -> Vec<u8> {
+    let size =
+        unsafe { libc::getxattr(cpath.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+    if size <= 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; size as usize];
+    let n = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+            0,
+            0,
+        )
+    };
+    if n < 0 {
+        return Vec::new();
+    }
+    buf.truncate(n as usize);
+    buf
+}
+
+/// Attach one extended attribute. Returns false when the filesystem refuses.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn set_source_xattr(path: &Path, name: &str, value: &[u8]) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let Ok(cname) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    let rc = unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            libc::setxattr(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        }
+        #[cfg(target_os = "macos")]
+        {
+            libc::setxattr(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+                0,
+            )
+        }
+    };
+    rc == 0
+}
+
 /// `(ctime, mtime, nlink)` of `path`. On Windows, `ctime` is the creation time,
 /// which is what `stat` reports there. A load must leave this triple unchanged.
 pub fn source_file_stamp(path: &Path) -> (u128, u128, u64) {
@@ -882,7 +1043,24 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let src = dir.join("model.fbx");
         fs::write(&src, b"not-a-real-fbx").unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert!(
+                super::set_source_xattr(&src, "user.modelview.test", b"keep"),
+                "could not attach a test xattr"
+            );
+        }
         let before = super::source_file_stamp(&src);
+        let xattrs_before = super::source_xattrs(&src);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert!(
+                xattrs_before
+                    .iter()
+                    .any(|(name, value)| name == "user.modelview.test" && value == b"keep"),
+                "xattr reader missed the test attribute: {xattrs_before:?}"
+            );
+        }
         let dest = dir.join("staged.fbx");
         stage_model(&src, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"not-a-real-fbx");
@@ -890,6 +1068,11 @@ mod tests {
             super::source_file_stamp(&src),
             before,
             "staging changed the source file's metadata"
+        );
+        assert_eq!(
+            super::source_xattrs(&src),
+            xattrs_before,
+            "staging changed the source file's xattrs"
         );
         #[cfg(unix)]
         {

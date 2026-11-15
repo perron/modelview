@@ -408,13 +408,35 @@ fn load_does_not_change_source_ctime_mtime_or_nlink() {
     let src = dir.join("cube.obj");
     fs::copy("testdata/generated/cube.obj", &src).unwrap();
     // Copying can itself be followed by a timestamp settle. Capture after the copy.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        assert!(
+            modelview::load::set_source_xattr(&src, "user.modelview.test", b"keep"),
+            "could not attach a test xattr"
+        );
+    }
     let before = modelview::load::source_file_stamp(&src);
+    let xattrs = modelview::load::source_xattrs(&src);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        assert!(
+            xattrs
+                .iter()
+                .any(|(name, value)| name == "user.modelview.test" && value == b"keep"),
+            "xattr reader missed the test attribute: {xattrs:?}"
+        );
+    }
     let (code, _) = json_stdout(&["info", src.to_str().unwrap(), "--json"]);
     assert_eq!(code, 0);
     let after = modelview::load::source_file_stamp(&src);
     assert_eq!(
         before, after,
         "load changed source ctime/mtime/nlink: before {before:?} after {after:?}"
+    );
+    assert_eq!(
+        modelview::load::source_xattrs(&src),
+        xattrs,
+        "load changed source extended attributes"
     );
     let _ = fs::remove_dir_all(&dir);
 }
