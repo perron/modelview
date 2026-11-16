@@ -19,7 +19,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers libxkbcommon-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers libxkbcommon-dev libxkbcommon-x11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev pkg-config xvfb
       - name: Khronos glTF-Validator
         if: runner.os == 'Linux'
         run: |
@@ -30,7 +30,12 @@ jobs:
           gltf_validator -h || true
       - name: Unit and corpus tests
         shell: bash
-        run: cargo test -- --test-threads=8
+        run: |
+          if [ "$(uname -s)" = "Linux" ]; then
+            xvfb-run -a cargo test -- --test-threads=8
+          else
+            cargo test -- --test-threads=8
+          fi
         env:
           # Linux runners have no GPU. Lavapipe is the software Vulkan adapter.
           # macOS and Windows try a real adapter and fall back to a software one.

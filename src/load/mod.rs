@@ -24,9 +24,12 @@ pub use self::obj::parse_obj;
 const DEFAULT_MEMORY_MB: u64 = 2048;
 
 static STOP_LOAD: AtomicBool = AtomicBool::new(false);
+static STOP_NOTIFIED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_TEMP: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-fn stop_requested() -> bool {
+/// A stop signal (SIGTERM, SIGINT, or the Windows console equivalents) has
+/// arrived. The window checks this and closes; a load still in progress exits.
+pub fn stop_requested() -> bool {
     STOP_LOAD.load(Ordering::Relaxed)
 }
 
@@ -327,24 +330,139 @@ fn stop_and_exit(dir: &Path) -> ! {
     std::process::exit(130);
 }
 
-fn install_stop_handler() {
-    #[cfg(unix)]
-    {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| unsafe {
+/// Install the process-wide stop handler. Safe to call more than once.
+/// The handler only stores a flag and wakes a waiter. It does not exit:
+/// the window has to see the flag and close, and a load in progress exits
+/// from ordinary code once it notices the flag.
+pub fn install_stop_handler() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        #[cfg(unix)]
+        unsafe {
+            let mut fds = [0i32; 2];
+            if libc::pipe(fds.as_mut_ptr()) == 0 {
+                WAKE_READ.store(fds[0], Ordering::Relaxed);
+                WAKE_WRITE.store(fds[1], Ordering::Relaxed);
+            }
             let mut action: libc::sigaction = std::mem::zeroed();
             action.sa_sigaction = handle_stop as *const () as libc::sighandler_t;
             action.sa_flags = 0;
             libc::sigemptyset(&mut action.sa_mask);
             libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
             libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
-        });
+        }
+        #[cfg(windows)]
+        unsafe {
+            let event = CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null());
+            WAKE_EVENT.store(event, Ordering::Relaxed);
+            // A new process group starts with Ctrl+C ignored. Turn that off,
+            // then handle Ctrl+C, Ctrl+Break, and console close ourselves.
+            SetConsoleCtrlHandler(None, 0);
+            SetConsoleCtrlHandler(Some(console_ctrl), 1);
+        }
+    });
+}
+
+/// Block until a stop signal has been delivered. The window waits on this
+/// from a side thread and then asks the event loop to repaint, so an idle
+/// window notices the signal immediately.
+pub fn block_until_stop() {
+    if stop_requested() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let fd = WAKE_READ.load(Ordering::Relaxed);
+        if fd >= 0 {
+            let mut buf = [0u8; 1];
+            loop {
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), 1) };
+                if n > 0 || stop_requested() {
+                    return;
+                }
+                if n < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                return;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let event = WAKE_EVENT.load(Ordering::Relaxed);
+        if !event.is_null() {
+            unsafe { WaitForSingleObject(event, u32::MAX) };
+            return;
+        }
+    }
+    while !stop_requested() {
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
 #[cfg(unix)]
+static WAKE_READ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(unix)]
+static WAKE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
 extern "C" fn handle_stop(_: libc::c_int) {
     STOP_LOAD.store(true, Ordering::Relaxed);
+    if STOP_NOTIFIED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let fd = WAKE_WRITE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = 1u8;
+        unsafe {
+            libc::write(fd, (&byte as *const u8).cast(), 1);
+        }
+    }
+}
+
+/// Ctrl+C is 0, Ctrl+Break is 1, console close is 2, logoff is 5, and
+/// shutdown is 6. Those are the Windows equivalents of SIGINT and SIGTERM.
+#[cfg(windows)]
+fn console_event_quits(ctrl: u32) -> bool {
+    matches!(ctrl, 0 | 1 | 2 | 5 | 6)
+}
+
+#[cfg(windows)]
+static WAKE_EVENT: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateEventW(
+        security: *mut core::ffi::c_void,
+        manual_reset: i32,
+        initial: i32,
+        name: *const u16,
+    ) -> *mut core::ffi::c_void;
+    fn SetEvent(handle: *mut core::ffi::c_void) -> i32;
+    fn WaitForSingleObject(handle: *mut core::ffi::c_void, millis: u32) -> u32;
+    fn SetConsoleCtrlHandler(handler: Option<extern "system" fn(u32) -> i32>, add: i32) -> i32;
+}
+
+#[cfg(windows)]
+extern "system" fn console_ctrl(ctrl: u32) -> i32 {
+    if !console_event_quits(ctrl) {
+        return 0;
+    }
+    STOP_LOAD.store(true, Ordering::Relaxed);
+    let event = WAKE_EVENT.load(Ordering::Relaxed);
+    if !event.is_null() {
+        unsafe { SetEvent(event) };
+    }
+    // Closing the console, logging off, or shutting down ends the process
+    // when this handler returns. The temp directory has to be gone by then.
+    if matches!(ctrl, 2 | 5 | 6) {
+        cleanup_active_temp();
+    }
+    1
 }
 
 /// OBJ materials and textures are read in this process, next to the original
@@ -932,6 +1050,15 @@ pub fn default_memory_mb() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn console_close_and_ctrl_c_both_ask_the_window_to_quit() {
+        for ctrl in [0, 1, 2, 5, 6] {
+            assert!(console_event_quits(ctrl), "control event {ctrl}");
+        }
+        assert!(!console_event_quits(3));
+    }
 
     #[test]
     fn corrupt_files_fail_without_panicking() {
