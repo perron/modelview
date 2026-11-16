@@ -512,6 +512,174 @@ fn a_blank_render_is_render_empty() {
     assert_eq!(modelview::error::exit_code(&err), 2);
 }
 
+fn temp_dir_for(pid: u32) -> bool {
+    let prefix = format!("modelview-{pid}-");
+    std::env::temp_dir()
+        .read_dir()
+        .unwrap()
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+}
+
+/// Wait until the window has finished loading a file and gone idle. The temp
+/// directory exists only while the load runs, so its disappearance with the
+/// process still alive is the idle state that used to ignore SIGTERM.
+fn wait_until_model_is_open(child: &mut std::process::Child) -> Result<(), String> {
+    let pid = child.id();
+    let start = std::time::Instant::now();
+    let mut saw_temp = false;
+    while start.elapsed() < Duration::from_secs(25) {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Err(format!("window exited before the signal ({status})"));
+        }
+        let exists = temp_dir_for(pid);
+        if exists {
+            saw_temp = true;
+        }
+        if saw_temp && !exists {
+            std::thread::sleep(Duration::from_millis(400));
+            if child.try_wait().unwrap().is_some() {
+                return Err("window closed after the load, before the signal".into());
+            }
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    Err(format!(
+        "file never finished loading (saw temp dir: {saw_temp})"
+    ))
+}
+
+fn wait_for_exit(
+    child: &mut std::process::Child,
+    limit: Duration,
+) -> Option<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < limit {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    None
+}
+
+fn spawn_window_with_file(log_name: &str) -> (std::process::Child, PathBuf) {
+    let log_path = std::env::temp_dir().join(format!(
+        "modelview-signal-{}-{log_name}.log",
+        std::process::id()
+    ));
+    let log = fs::File::create(&log_path).unwrap();
+    let mut cmd = Command::new(bin());
+    cmd.arg("testdata/generated/cube.obj")
+        .env("MODELVIEW_STAGE_SLEEP_MS", "700")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log));
+    if let Ok(value) = std::env::var("MODELVIEW_SOFTWARE") {
+        cmd.env("MODELVIEW_SOFTWARE", value);
+    } else if cfg!(target_os = "linux") {
+        cmd.env("MODELVIEW_SOFTWARE", "1");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Own process group so Ctrl+C can be delivered to the window alone.
+        cmd.creation_flags(0x00000200);
+    }
+    let child = cmd.spawn().expect("spawn window");
+    (child, log_path)
+}
+
+fn finish_signal_test(child: &mut std::process::Child, log_path: &std::path::Path, how: &str) {
+    let pid = child.id();
+    if let Err(err) = wait_until_model_is_open(child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let log = fs::read_to_string(log_path).unwrap_or_default();
+        panic!("{err}\n{log}");
+    }
+    let started = std::time::Instant::now();
+    send_quit(pid, how);
+    let status = wait_for_exit(child, Duration::from_secs(3)).unwrap_or_else(|| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{how} left the window running for more than 3 seconds");
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{how} took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "{how} should close the window and exit 130, got {status}"
+    );
+    assert!(!temp_dir_for(pid), "temp dir survived {how}");
+    let _ = fs::remove_file(log_path);
+}
+
+#[cfg(unix)]
+fn send_quit(pid: u32, how: &str) {
+    let status = Command::new("kill")
+        .args([how, &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "kill {how} failed");
+}
+
+#[cfg(windows)]
+fn send_quit(pid: u32, how: &str) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: usize, add: i32) -> i32;
+        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+    }
+    let event = match how {
+        "ctrl-c" => 0u32,
+        "ctrl-break" => 1,
+        other => panic!("unknown windows quit {other}"),
+    };
+    unsafe {
+        // This test process ignores the event. The window is in its own group.
+        SetConsoleCtrlHandler(0, 1);
+        let ok = GenerateConsoleCtrlEvent(event, pid);
+        assert!(
+            ok != 0,
+            "GenerateConsoleCtrlEvent failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_closes_the_window_after_a_file_is_open() {
+    let (mut child, log) = spawn_window_with_file("term");
+    finish_signal_test(&mut child, &log, "-TERM");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigint_closes_the_window_after_a_file_is_open() {
+    let (mut child, log) = spawn_window_with_file("int");
+    finish_signal_test(&mut child, &log, "-INT");
+}
+
+#[cfg(windows)]
+#[test]
+fn ctrl_c_closes_the_window_after_a_file_is_open() {
+    let (mut child, log) = spawn_window_with_file("ctrl-c");
+    finish_signal_test(&mut child, &log, "ctrl-c");
+}
+
+#[cfg(windows)]
+#[test]
+fn ctrl_break_closes_the_window_after_a_file_is_open() {
+    let (mut child, log) = spawn_window_with_file("ctrl-break");
+    finish_signal_test(&mut child, &log, "ctrl-break");
+}
+
 #[cfg(unix)]
 #[test]
 fn sigterm_during_load_removes_the_temp_dir() {

@@ -9,6 +9,10 @@ use crate::scene::Scene;
 use crate::MvError;
 
 pub fn run(file: Option<PathBuf>) -> i32 {
+    // Installed before the window exists, so a signal during the first frame
+    // is remembered. Loading a file used to be the only place this ran, which
+    // left an idle window swallowing SIGTERM and SIGINT.
+    load::install_stop_handler();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -20,6 +24,14 @@ pub fn run(file: Option<PathBuf>) -> i32 {
         "modelview",
         options,
         Box::new(move |cc| {
+            let ctx = cc.egui_ctx.clone();
+            std::thread::Builder::new()
+                .name("modelview-stop".into())
+                .spawn(move || {
+                    load::block_until_stop();
+                    ctx.request_repaint();
+                })
+                .ok();
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             Ok(Box::new(Viewer::new(file)))
         }),
@@ -27,8 +39,13 @@ pub fn run(file: Option<PathBuf>) -> i32 {
         Ok(()) => {
             // A quit during a Desktop permission prompt must not leave the
             // temp directory the loader created before the read returned.
+            // A signal quit uses the same cleanup and reports 130.
             crate::load::cleanup_active_temp();
-            0
+            if crate::load::stop_requested() {
+                130
+            } else {
+                0
+            }
         }
         Err(err) => {
             eprintln!("modelview: {err}");
@@ -157,6 +174,10 @@ impl Viewer {
 
 impl eframe::App for Viewer {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if load::stop_requested() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         self.poll_load(ui.ctx());
         let dropped: Vec<PathBuf> = ui.input(|i| {
             i.raw
