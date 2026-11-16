@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS universal zip
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build universal binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/modelview \
+            target/x86_64-apple-darwin/release/modelview \
+            -output dist/modelview
+          lipo -info dist/modelview
+      - name: App zip and checksum
+        run: |
+          APP="dist/Modelview.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp dist/modelview "$APP/Contents/MacOS/modelview"
+          cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
+          chmod +x "$APP/Contents/MacOS/modelview"
+          "$APP/Contents/MacOS/modelview" --version
+          "$APP/Contents/MacOS/modelview" --help
+          ditto -c -k --keepParent "$APP" dist/modelview-macos-universal.zip
+          (cd dist && shasum -a 256 modelview-macos-universal.zip > modelview-macos-universal.zip.sha256)
+          cat dist/modelview-macos-universal.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: |
+            dist/modelview-macos-universal.zip
+            dist/modelview-macos-universal.zip.sha256
+
+  windows:
+    name: Windows x64 zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Zip and checksum
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/modelview.exe dist/modelview.exe
+          & dist/modelview.exe --version
+          Compress-Archive -Path dist/modelview.exe -DestinationPath dist/modelview-windows-x64.zip
+          $hash = (Get-FileHash dist/modelview-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  modelview-windows-x64.zip" | Set-Content -Encoding ascii dist/modelview-windows-x64.zip.sha256
+          Get-Content dist/modelview-windows-x64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            dist/modelview-windows-x64.zip
+            dist/modelview-windows-x64.zip.sha256
+
+  publish:
+    name: Publish GitHub release
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          find dist -type f -print
+          cat > notes.md << 'EOF'
+          modelview opens FBX, GLB/glTF, OBJ, STL, and PLY.
+
+          One binary is the window, the command line, and the MCP server.
+
+          Open a file in the window:
+
+              modelview path/to/file.fbx
+
+          For an AI agent, run the MCP server and limit it to the folders it may read:
+
+              modelview mcp --allow /absolute/path/to/assets
+
+          The Mac build is unsigned. The first launch needs right-click Open, or:
+
+              xattr -d com.apple.quarantine Modelview.app
+          EOF
+          mapfile -t assets < <(find dist -type f \( -name '*.zip' -o -name '*.sha256' \) | sort)
+          test "${#assets[@]}" -eq 4
+          gh release create "$tag" \
+            --title "modelview $tag" \
+            --notes-file notes.md \
+            "${assets[@]}"
