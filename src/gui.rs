@@ -12,7 +12,8 @@ pub fn run(file: Option<PathBuf>) -> i32 {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_title("modelview"),
+            .with_title("modelview")
+            .with_icon(window_icon()),
         ..Default::default()
     };
     match eframe::run_native(
@@ -706,7 +707,24 @@ fn draw_node(
 
 #[cfg(test)]
 mod tests {
-    use super::io_allowed_this_frame;
+    use super::{io_allowed_this_frame, window_icon};
+
+    #[test]
+    fn window_icon_is_the_cube_mark() {
+        let icon = window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        let top = &icon.rgba[(96 * 256 + 128) * 4..][..4];
+        assert!(top[0] > 180 && top[3] == 255, "light top face at 256 px");
+        assert_eq!(&icon.rgba[..4], &[0, 0, 0, 0], "transparent rounded corner");
+
+        let small = image::load_from_memory(include_bytes!("../packaging/icon/icon-16.png"))
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(small.dimensions(), (16, 16));
+        let face = small.get_pixel(8, 6);
+        assert!(face[0] > 160 && face[3] == 255, "cube still reads at 16 px");
+    }
 
     #[test]
     fn file_read_waits_until_the_interface_has_been_drawn() {
@@ -714,6 +732,18 @@ mod tests {
         assert!(!io_allowed_this_frame(&mut drawn));
         assert!(drawn);
         assert!(io_allowed_this_frame(&mut drawn));
+    }
+}
+
+fn window_icon() -> egui::IconData {
+    let image = image::load_from_memory(include_bytes!("../packaging/icon/icon-256.png"))
+        .expect("modelview window icon")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
     }
 }
 

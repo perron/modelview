@@ -67,6 +67,9 @@ Headless tests use lavapipe (`mesa-vulkan-drivers`).
 
 ## Window
 
+The Dock and taskbar icon is a shaded cube on a dark rounded square. The
+drawing script is `packaging/icon/render_icon.py`.
+
 `modelview` with no arguments opens an empty window. `modelview path/to/file.fbx`
 opens that file. You can also use File → Open, or drop a file on the window.
 

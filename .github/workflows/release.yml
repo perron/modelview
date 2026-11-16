@@ -33,10 +33,15 @@ jobs:
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
           cp dist/modelview "$APP/Contents/MacOS/modelview"
           cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
+          cp packaging/macos/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
           chmod +x "$APP/Contents/MacOS/modelview"
+          test -s "$APP/Contents/Resources/AppIcon.icns"
+          test "$(plutil -extract CFBundleIconFile raw "$APP/Contents/Info.plist")" = "AppIcon"
           "$APP/Contents/MacOS/modelview" --version
           "$APP/Contents/MacOS/modelview" --help
           ditto -c -k --keepParent "$APP" dist/modelview-macos-universal.zip
+          magic=$(unzip -p dist/modelview-macos-universal.zip "Modelview.app/Contents/Resources/AppIcon.icns" | head -c 4)
+          test "$magic" = "icns"
           (cd dist && shasum -a 256 modelview-macos-universal.zip > modelview-macos-universal.zip.sha256)
           cat dist/modelview-macos-universal.zip.sha256
       - uses: actions/upload-artifact@v4
@@ -59,6 +64,23 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/modelview.exe dist/modelview.exe
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class IconCheck {
+            [DllImport("kernel32", SetLastError=true, CharSet=CharSet.Unicode)]
+            public static extern IntPtr LoadLibraryEx(string lpFileName, IntPtr hFile, uint dwFlags);
+            [DllImport("kernel32", SetLastError=true)]
+            public static extern IntPtr FindResource(IntPtr hModule, IntPtr lpName, IntPtr lpType);
+            public static void RequireGroupIcon(string path) {
+              var module = LoadLibraryEx(path, IntPtr.Zero, 2);
+              if (module == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+              var resource = FindResource(module, (IntPtr)1, (IntPtr)14);
+              if (resource == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "modelview.exe has no RT_GROUP_ICON");
+            }
+          }
+          "@
+          [IconCheck]::RequireGroupIcon((Resolve-Path dist\modelview.exe).Path)
           & dist/modelview.exe --version
           Compress-Archive -Path dist/modelview.exe -DestinationPath dist/modelview-windows-x64.zip
           $hash = (Get-FileHash dist/modelview-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
