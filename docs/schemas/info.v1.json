@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "modelview/info/v1",
+  "title": "modelview info",
+  "type": "object",
+  "required": ["schema", "ok", "file", "counts", "bounds", "notes", "problems"],
+  "properties": {
+    "schema": { "const": "modelview/info/v1" },
+    "ok": { "type": "boolean" },
+    "file": {
+      "type": "object",
+      "required": ["path", "name", "format", "size_bytes", "sha256"],
+      "properties": {
+        "path": { "type": "string" },
+        "name": { "type": "string" },
+        "format": { "type": "string", "enum": ["fbx", "gltf", "glb", "obj", "stl", "ply"] },
+        "size_bytes": { "type": "integer" },
+        "sha256": { "type": "string" }
+      }
+    },
+    "fbx": {
+      "type": "object",
+      "required": ["version", "ascii"],
+      "properties": {
+        "version": { "type": "integer" },
+        "ascii": { "type": "boolean" },
+        "creator": { "type": "string" },
+        "original_unit_meters": { "type": "number" },
+        "original_up_axis": { "type": "string" }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "required": ["nodes", "meshes", "vertices", "triangles", "materials", "textures", "bones", "skins", "animations"]
+    },
+    "bounds": {
+      "type": "object",
+      "required": ["min", "max", "center", "radius"]
+    },
+    "notes": { "type": "object" },
+    "nodes": { "type": "array" },
+    "meshes": { "type": "array" },
+    "materials": { "type": "array" },
+    "textures": { "type": "array" },
+    "animations": { "type": "array" },
+    "problems": { "type": "array" }
+  }
+}

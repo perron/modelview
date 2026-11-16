@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>modelview</string>
+  <key>CFBundleDisplayName</key>
+  <string>modelview</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.karlperron.modelview</string>
+  <key>CFBundleVersion</key>
+  <string>0.1.0</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleExecutable</key>
+  <string>modelview</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>modelview opens the 3D file you picked from the Desktop.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>modelview opens the 3D file you picked from Documents.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>modelview opens the 3D file you picked from Downloads.</string>
+</dict>
+</plist>
