@@ -1152,8 +1152,18 @@ mod tests {
         assert!(!pid_alive(pid), "pid {pid} still looks alive");
         let dir = std::env::temp_dir().join(format!("modelview-{pid}-dead"));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("model.fbx"), b"leftover").unwrap();
+        // A parallel test may sweep this dead-pid directory between the
+        // create and the write. Plant the marker again if that happens.
+        let marker = dir.join("model.fbx");
+        let mut planted = false;
+        for _ in 0..8 {
+            fs::create_dir_all(&dir).unwrap();
+            if fs::write(&marker, b"leftover").is_ok() {
+                planted = true;
+                break;
+            }
+        }
+        assert!(planted, "could not plant the dead owner's temp dir");
         let mine = std::env::temp_dir().join(format!("modelview-{}-live", std::process::id()));
         let _ = fs::remove_dir_all(&mine);
         fs::create_dir_all(&mine).unwrap();
